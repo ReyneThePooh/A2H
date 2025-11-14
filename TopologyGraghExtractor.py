@@ -30,6 +30,8 @@ class TopologyGraphExtractor:
             for file in files:
                 if file.endswith('.java'):
                     java_path = os.path.join(root, file)
+                    # 将单斜杠替换为双斜杠
+                    java_path = java_path.replace('/', '\\')
                     self.java_paths.append(java_path)
 
         print(f"找到 {len(self.java_paths)} 个Java文件")

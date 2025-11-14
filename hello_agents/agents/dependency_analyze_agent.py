@@ -1,5 +1,4 @@
 from typing import Optional
-
 from ..core.agent import Agent
 from ..core.llm import HelloAgentsLLM
 from ..core.config import Config
@@ -57,13 +56,13 @@ class DependencyAnalyzeAgent(Agent):
         分析Java代码的依赖关系
 
         Args:
-            input_text: 格式为 "文件路径|||文件内容"
+            input_text: 格式为 "目录树|||文件内容"
             **kwargs: 其他参数传递给LLM
 
         Returns:
             依赖文件的绝对路径列表（每行一个路径）
         """
-        # 分割文件路径和代码内容
+        # 分割目录树和代码内容
         parts = input_text.split('|||', 1)
         if len(parts) != 2:
             raise ValueError("input_text格式错误，应为: 文件路径|||文件内容")
@@ -71,7 +70,7 @@ class DependencyAnalyzeAgent(Agent):
         android_project_tree = parts[0].strip()
         java_code = parts[1].strip()
 
-        # 将Java文件路径和代码填充到提示词模板中
+        # 将目录树和代码填充到提示词模板中
         prompt = self.system_prompt.format(
             android_project_tree=android_project_tree,
             java_code=java_code
@@ -92,7 +91,7 @@ class DependencyAnalyzeAgent(Agent):
         分析Java代码依赖并返回路径列表
 
         Args:
-            input: 要分析的Java文件路径以及Java代码，格式为 "文件路径|||文件内容"
+            input: 要分析的Java文件路径以及Java代码，格式为 "目录树|||文件内容"
             **kwargs: 其他参数传递给LLM
 
         Returns:
