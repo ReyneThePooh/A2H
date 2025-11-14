@@ -6,7 +6,7 @@ from ..core.config import Config
 
 
 DEFAULT_PROMPT = """
-你是一位专业的Java代码依赖分析专家。你的任务是分析给定的Java文件路径以及Java代码，识别其所有依赖关系，并以绝对路径的形式输出。
+你是一位专业的Java代码依赖分析专家。你的任务是分析给定的安卓项目目录结构以及Java代码，识别其所有依赖关系，并以绝对路径的形式输出。
 
 # 分析规则:
 1. 识别所有import语句中的依赖
@@ -16,14 +16,14 @@ DEFAULT_PROMPT = """
 5. 排除Java标准库以及第三方库的依赖（如java.util.*, java.lang.*等）
 6. 将包名转换为绝对路径格式（用反斜杠\分隔，并添加.java后缀）
 
-# 输入的Java文件路径：
-{java_path}
+# 输入的安卓目录结构：
+{android_project_tree}
 
 # 输入的Java代码:
 {java_code}
 
 # 输出格式要求:
-请仅输出依赖的Java文件相对路径列表，每行一个路径，不要包含任何解释或额外信息。
+请仅输出依赖的Java文件绝对路径列表，每行一个路径，不要包含任何解释或额外信息。
 路径格式示例: D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\BaseBean.java
 
 # 依赖列表:
@@ -68,14 +68,16 @@ class DependencyAnalyzeAgent(Agent):
         if len(parts) != 2:
             raise ValueError("input_text格式错误，应为: 文件路径|||文件内容")
 
-        java_file_path = parts[0].strip()
+        android_project_tree = parts[0].strip()
         java_code = parts[1].strip()
 
         # 将Java文件路径和代码填充到提示词模板中
         prompt = self.system_prompt.format(
-            java_path=java_file_path,
+            android_project_tree=android_project_tree,
             java_code=java_code
         )
+
+        # print(prompt)
 
         # 构建消息
         messages = [{"role": "user", "content": prompt}]
