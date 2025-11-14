@@ -1,0 +1,27 @@
+📁 diary-1.0.1/
+├── 📁 app/
+├──     📁 src/
+├──         📁 main/
+├──         │   📁 java/
+├──         │       📁 com/
+├──         │           📁 app/
+├──         │               📁 diary/
+├──         │               │   📁 adapter/
+├──         │               │   📁 bean/
+├──         │               │   📁 data/
+├──         │               │       📁 impl/
+├──         │               │   📁 db/
+├──         │               │   📁 ui/
+├──         │                   📁 utils/
+├──             📁 res/
+├──             │   📁 drawable/
+├──             │   📁 layout/
+├──             │   📁 menu/
+├──             │   📁 mipmap-anydpi-v26/
+├──             │   📁 mipmap-hdpi/
+├──             │   📁 mipmap-mdpi/
+├──             │   📁 mipmap-xhdpi/
+├──             │   📁 mipmap-xxhdpi/
+├──             │   📁 mipmap-xxxhdpi/
+├──             │   📁 values/
+├──                 📁 xml/
