@@ -6,7 +6,7 @@ from ..core.config import Config
 
 
 DEFAULT_PROMPT = """
-你是一位专业的Java代码依赖分析专家。你的任务是分析给定的Java文件路径以及Java代码，识别其所有依赖关系，并以绝对路径的形式输出。
+你是一位专业的Java代码依赖分析专家。你的任务是分析给定的项目文件目录以及Java代码，识别其所有依赖关系，并以绝对路径的形式输出。
 
 # 分析规则:
 1. 识别所有import语句中的依赖
@@ -21,6 +21,9 @@ DEFAULT_PROMPT = """
 
 # 输入的Java代码:
 {java_code}
+
+# 目录上下文（可选）：
+{source_context}
 
 # 输出格式要求:
 请仅输出依赖的Java文件相对路径列表，每行一个路径，不要包含任何解释或额外信息。
