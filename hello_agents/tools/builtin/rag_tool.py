@@ -122,6 +122,7 @@ class RAGTool(Tool):
 
         # 根据action调用对应的方法，传入提取的参数
         try:
+            # 添加文档
             if action == "add_document":
                 return self._add_document(
                     file_path=parameters.get("file_path"),
@@ -130,6 +131,7 @@ class RAGTool(Tool):
                     chunk_size=parameters.get("chunk_size", 800),
                     chunk_overlap=parameters.get("chunk_overlap", 100)
                 )
+            # 添加文本
             elif action == "add_text":
                 return self._add_text(
                     text=parameters.get("text"),
@@ -138,6 +140,7 @@ class RAGTool(Tool):
                     chunk_size=parameters.get("chunk_size", 800),
                     chunk_overlap=parameters.get("chunk_overlap", 100)
                 )
+            # 查询RAG，返回问题答案
             elif action == "ask":
                 question = parameters.get("question") or parameters.get("query")
                 return self._ask(
@@ -154,7 +157,7 @@ class RAGTool(Tool):
                     limit=parameters.get("limit", 5),
                     min_score=parameters.get("min_score", 0.1),
                     enable_advanced_search=parameters.get("enable_advanced_search", True),
-                    max_chars=parameters.get("max_chars", 1200),
+                    max_chars=parameters.get("max_chars", 10000),
                     include_citations=parameters.get("include_citations", True),
                     namespace=parameters.get("namespace", "default")
                 )
@@ -355,7 +358,7 @@ class RAGTool(Tool):
         limit: int = 5,
         min_score: float = 0.1,
         enable_advanced_search: bool = True,
-        max_chars: int = 1200,
+        max_chars: int = 10000,
         include_citations: bool = True,
         namespace: str = "default"
     ) -> str:
@@ -403,7 +406,14 @@ class RAGTool(Tool):
             for i, result in enumerate(results, 1):
                 meta = result.get("metadata", {})
                 score = result.get("score", 0.0)
-                content = meta.get("content", "")[:200] + "..."
+
+                content = meta.get("content", "")
+                if len(content) > max_chars:
+                    content = content[:max_chars] + "..."
+                else:
+                    content = content
+
+                # content = meta.get("content", "")[:200] + "..."
                 source = meta.get("source_path", "unknown")
                 
                 # 安全处理Unicode
@@ -505,7 +515,7 @@ class RAGTool(Tool):
                 source = meta.get("source_path", "unknown")
                 score = result.get("score", 0.0)
                 total_score += score
-                
+
                 if content:
                     # 清理内容格式
                     cleaned_content = self._clean_content_for_context(content)

@@ -2,7 +2,10 @@ import os
 from dotenv import load_dotenv
 from hello_agents import HelloAgentsLLM
 from hello_agents.agents.dependency_analyze_agent import DependencyAnalyzeAgent
-from hello_agents.agents.xml_layout_analyze_agent import XMLLayoutAnalyzeAgent
+from hello_agents.agents.interaction_analyzer import InteractionAnalyzeAgent
+from hello_agents.agents.resource_analyze_agent import ResourceAnalyzeAgent
+from hello_agents.agents.component_extraction import FunctionalUnitAnalyzeAgent
+
 from utils import get_project_structure
 
 class TopologyGraphExtractor:
@@ -14,74 +17,160 @@ class TopologyGraphExtractor:
             project_path: Android项目根路径
         """
         self.project_path = os.path.abspath(project_path) # 项目根目录
-        self.topology_graph = {} # 拓扑图节点
-        self.java_paths = [] # 存储java文件路径
-        self.xml_to_java_map = {} # XML文件关联的所有XML文件
+        self.support_java_dependency = {} # support类java依赖
+        self.interaction_java_dependency = {} # 交互类java依赖
+
+
+        self.interaction_java_paths = set() # 存储引用XML文件的Java文件路径
+        self.support_java_paths = set() # 存储Java文件路径
+        self.xml_paths = set() # 存储XML文件路径
+        self.component = [] # 功能单元
+
         self.topology_order = [] # 拓扑图排序
+        self.java_resources = {} # 资源文件
+        self.xml_resources = {} # 资源文件
 
     def _scan_project(self):
         """
-        扫描Android项目，收集所有Java文件
+        扫描Android项目，收集所有Java文件以及XML布局文件
         """
         print(f"开始扫描项目: {self.project_path}")
 
-        # 扫描项目中的所有Java文件
+        # 扫描项目中的所有Java文件和XML文件
         for root, _, files in os.walk(self.project_path):
             # 跳过构建目录
             if 'build' in root or '.git' in root:
                 continue
 
             for file in files:
+                file_path = os.path.join(root, file)
+                # 将单斜杠替换为双斜杠
+                file_path = file_path.replace('/', '\\')
+
                 if file.endswith('.java'):
-                    java_path = os.path.join(root, file)
-                    # 将单斜杠替换为双斜杠
-                    java_path = java_path.replace('/', '\\')
-                    self.java_paths.append(java_path)
+                    self.support_java_paths.add(file_path)
+                elif file.endswith('.xml'):
+                    # 可以选择只收集layout目录下的XML文件
+                    if 'layout' in root or 'res' in root:
+                        self.xml_paths.add(file_path)
 
-        print(f"找到 {len(self.java_paths)} 个Java文件")
+        print(f"找到 {len(self.support_java_paths)} 个Java文件")
+        print(f"找到 {len(self.xml_paths)} 个XML文件")
 
-    def _analyze_dependencies(self):
+    def _select_java(self):
         """
-        分析所有Java文件的依赖关系，包括Java依赖类以及引用XML布局文件
+        选择出与交互逻辑有关的Java文件，存储在列表中
         """
-        project_structure = get_project_structure(self.project_path)
-        # 加载环境变量
         load_dotenv()
-        # 创建LLM实例 - 框架自动检测provider
         llm = HelloAgentsLLM()
-        # 布局分析智能体
-        xml_agent = XMLLayoutAnalyzeAgent(
+        xml_agent = InteractionAnalyzeAgent(
             name="布局分析",
             llm=llm,
         )
-        # Java分析智能体
+
+        self.interaction_java_paths = set()
+
+        # 转换为列表以便分批处理
+        java_paths_list = list(self.support_java_paths)
+        batch_size = 5
+        total_batches = (len(java_paths_list) + batch_size - 1) // batch_size
+
+        print(f"开始分析Java文件类别，共 {len(java_paths_list)} 个文件，分 {total_batches} 批处理")
+
+        # 分批处理
+        for i in range(0, len(java_paths_list), batch_size):
+            batch_paths = java_paths_list[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            print(f"处理第 {batch_num}/{total_batches} 批...")
+
+            java_dict = {}
+            for java_path in batch_paths:
+                try:
+                    with open(java_path, 'r', encoding='utf-8') as f:
+                        java_code = f.read()
+                        java_dict[java_path] = java_code
+                except Exception as e:
+                    print(f"读取文件失败 {java_path}: {e}")
+                    continue
+
+            # 将字典转换为字符串传递给agent
+            java_dict_str = str(java_dict)
+
+            # 调用agent分析
+            try:
+                related_paths = xml_agent.analyze_layouts(java_dict_str)
+                if related_paths:
+                    self.interaction_java_paths.update(related_paths)
+            except Exception as e:
+                print(f"分析第 {batch_num} 批文件时出错: {e}")
+                continue
+
+        # 从原java_paths中移除与交互相关的文件
+        self.support_java_paths -= self.interaction_java_paths
+
+        print(f"分析完成: 找到 {len(self.interaction_java_paths)} 个与交互相关的Java文件")
+        print(f"剩余 {len(self.support_java_paths)} 个纯Java文件")
+
+
+    def _component_extraction(self):
+        load_dotenv()
+        llm = HelloAgentsLLM()
+        agent = FunctionalUnitAnalyzeAgent(name='功能模块分析智能体', llm=llm)
+        java = {}
+        xml = {}
+        for java_path in self.interaction_java_paths:
+            with open(java_path, 'r', encoding='utf-8') as f:
+                java[java_path] = f.read()
+        for xml_path in self.xml_paths:
+            with open(xml_path, 'r', encoding='utf-8') as f:
+                xml[xml_path] = f.read()
+        self.component = agent.analyze_units(str(java), str(xml))
+
+    def _analyze_dependencies(self):
+        """
+        分析Java文件以及Component的Java依赖关系
+        """
+        project_structure = get_project_structure(self.project_path)
+        load_dotenv()
+        java_llm = HelloAgentsLLM()
         java_agent = DependencyAnalyzeAgent(
             name="Java依赖分析",
-            llm=llm,
+            llm=java_llm,
         )
-        for java_path in self.java_paths:
-            # 创建节点
-            java_path = os.path.abspath(java_path)
-            # 节点记录关联XML布局文件以及依赖Java类
-            node_info = {
-                'xml_paths': [],
-                'dependencies': [],
-            }
+
+        # 收集support类java依赖的java类
+        for java_path in self.support_java_paths:
             with open(java_path, 'r', encoding='utf-8') as f:
                 java_code = f.read()
-            input_text = f"{project_structure}|||{java_code}"
-            # 获取Java依赖类
-            node_info['dependencies'] = java_agent.analyze_dependencies(input_text)
-            # 获取关联XML布局文件
-            node_info['xml_paths'] = xml_agent.analyze_layouts(input_text)
-            # 添加到拓扑图
-            self.topology_graph[java_path] = node_info
+            self.support_java_dependency[java_path] = set(java_agent.analyze_dependencies(project_structure, java_code=java_code))
+            self.support_java_dependency[java_path].discard(java_path)
 
-            # 构建XML到Java的反向映射
-            for xml_path in node_info['xml_paths']:
-                if xml_path not in self.xml_to_java_map:
-                    self.xml_to_java_map[xml_path] = []
-                self.xml_to_java_map[xml_path].append(java_path)
+        # 收集交互类java的依赖类（排除交互类java）
+        for java_path in self.interaction_java_paths:
+            with open(java_path, 'r', encoding='utf-8') as f:
+                java_code = f.read()
+            self.interaction_java_dependency[java_path] = set(java_agent.analyze_dependencies(project_structure, java_code=java_code))
+            self.interaction_java_dependency[java_path] -= self.interaction_java_paths
+
+    def _analyze_resource(self):
+        """
+        分析Java文件或XML文件依赖的资源文件
+        """
+        res_llm = HelloAgentsLLM()
+        agent = ResourceAnalyzeAgent(name='资源提取', llm=res_llm)
+        project_structure = get_project_structure(self.project_path)
+
+        for java_path in self.support_java_paths:
+            with open(java_path, 'r', encoding='utf-8') as f:
+                java_code = f.read()
+            java_resource = agent.analyze_resources(project_structure, java_code=java_code)
+            self.java_resources[java_path] = java_resource
+
+        for xml_path in self.xml_paths:
+            with open(xml_path, 'r', encoding='utf-8') as f:
+                xml_code = f.read()
+            xml_resource = agent.analyze_resources(project_structure, xml_code=xml_code)
+            self.xml_resources[xml_path] = xml_resource
 
     def build_topological_order(self):
         """
@@ -92,29 +181,34 @@ class TopologyGraphExtractor:
             list: 拓扑排序后的Java文件路径列表，如果存在循环依赖返回None
         """
         from collections import deque, defaultdict
+
         self._scan_project()
+        self._select_java()
+        self._component_extraction()
         self._analyze_dependencies()
 
+        # 所有纯Java文件（不与XML关联的）
+        all_nodes = set(self.support_java_dependency.keys())
+
         # 构建图的邻接表和入度表
-        # graph[B] = [A1, A2, ...] 表示 B->A1, B->A2（B被A1、A2依赖）
+        # graph[A] = [B1, B2, ...] 表示 A->B1, A->B2（B1、B2依赖A）
         graph = defaultdict(list)
         in_degree = defaultdict(int)
 
         # 初始化所有节点的入度为0
-        all_nodes = set(self.topology_graph.keys())
         for node in all_nodes:
             in_degree[node] = 0
 
-        # 构建图
-        for java_file, info in self.topology_graph.items():
-            dependencies = info['dependencies']
+        # 构建图：A依赖B，则B->A（B指向A）
+        for java_file, dependencies in self.support_java_dependency.items():
             for dep in dependencies:
-                # dep -> java_file (java_file依赖dep)
-                if dep in all_nodes:  # 只考虑项目内的依赖
+                # 只考虑在all_nodes中的依赖（项目内的纯Java文件）
+                if dep in all_nodes:
+                    # dep -> java_file (java_file依赖dep，所以dep指向java_file)
                     graph[dep].append(java_file)
                     in_degree[java_file] += 1
 
-        # Kahn算法：找出所有入度为0的节点
+        # Kahn算法：找出所有入度为0的节点（没有依赖其他节点的节点）
         queue = deque()
         for node in all_nodes:
             if in_degree[node] == 0:
@@ -127,7 +221,7 @@ class TopologyGraphExtractor:
             current = queue.popleft()
             topological_order.append(current)
 
-            # 遍历当前节点的所有邻居
+            # 遍历当前节点指向的所有邻居节点
             for neighbor in graph[current]:
                 in_degree[neighbor] -= 1
                 # 如果邻居入度变为0，加入队列
@@ -138,19 +232,42 @@ class TopologyGraphExtractor:
         if len(topological_order) != len(all_nodes):
             # 找出循环依赖的节点
             remaining_nodes = all_nodes - set(topological_order)
-            print(f"涉及循环依赖的节点: {remaining_nodes}")
+            print(f"⚠️ 检测到循环依赖，涉及 {len(remaining_nodes)} 个节点")
+
+            # 打印循环依赖的详细信息
+            for node in remaining_nodes:
+                deps_in_cycle = self.support_java_dependency[node] & remaining_nodes
+                if deps_in_cycle:
+                    print(f"  - {node}")
+                    print(f"    依赖: {deps_in_cycle}")
+
             return None
 
         # 保存拓扑序列
         self.topological_order = topological_order
+        print(f"✅ 拓扑排序成功，共 {len(topological_order)} 个支持类型Java文件")
         return topological_order
 
 if __name__ == "__main__":
     project_dir = 'D:\projects\\uitranslate\diary-1.0.1'
     extractor = TopologyGraphExtractor(project_dir)
-    order = extractor.build_topological_order()
-    for node in order:
-        deps = extractor.topology_graph[node]['dependencies']
-        print(f"{node}: {deps}")
+    extractor._scan_project()
+    extractor._select_java()
+    # extractor._component_extraction()
+    # extractor._analyze_dependencies()
+    #
+    # print(type(extractor.support_java_paths)) # set
+    # print(type(extractor.component)) # list
+    # print(type(extractor.java_node)) # dict
+    #
+    print(extractor.support_java_paths)
+    print(extractor.interaction_java_paths)
+    # print(extractor.component)
+    # print(extractor.java_node)
+
+    # order = extractor.build_topological_order()
+    # for java_path in order:
+    #     print(java_path + ': ' + str(extractor.java_node[java_path]))
+
 
 

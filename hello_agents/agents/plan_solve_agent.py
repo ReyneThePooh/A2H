@@ -60,7 +60,8 @@ class Planner:
         Returns:
             步骤列表
         """
-        prompt = self.prompt_template.format(question=question)
+        # prompt = self.prompt_template.format(question=question)
+        prompt = self.prompt_template.format(java_code=question)
         messages = [{"role": "user", "content": prompt}]
 
         print("--- 正在生成计划 ---")
@@ -69,7 +70,8 @@ class Planner:
 
         try:
             # 提取Python代码块中的列表
-            plan_str = response_text.split("```python")[1].split("```")[0].strip()
+            plan_str = response_text.split("```python")[1].split("```")[0].strip() \
+                if "```python" in response_text else response_text.strip()
             plan = ast.literal_eval(plan_str)
             return plan if isinstance(plan, list) else []
         except (ValueError, SyntaxError, IndexError) as e:
