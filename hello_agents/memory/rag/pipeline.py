@@ -274,15 +274,52 @@ def _chunk_paragraphs(paragraphs: List[Dict], chunk_tokens: int, overlap_tokens:
     cur: List[Dict] = []
     cur_tokens = 0
     i = 0
+
+    loop_counter = 0
+    MAX_LOOPS = len(paragraphs) * 10  # 最多循环次数
+
     while i < len(paragraphs):
+        loop_counter += 1
+        if loop_counter > MAX_LOOPS:
+            raise RuntimeError(f"Possible infinite loop detected. i={i}, len={len(paragraphs)}")
         p = paragraphs[i]
         p_tokens = _approx_token_len(p["content"]) or 1
+
+        # 处理单个段落超过chunk_tokens的情况
+        if p_tokens > chunk_tokens:
+            # 确保有内容再添加
+            if p["content"].strip():
+                chunks.append({
+                    "content": p["content"],
+                    "start": p["start"],
+                    "end": p["end"],
+                    "heading_path": p.get("heading_path"),
+                })
+            i += 1  # 确保索引前进
+            # 重置当前chunk，但不跳过后续逻辑
+            if cur:
+                # 先提交当前积攒的chunk
+                content = "\n\n".join(x["content"] for x in cur)
+                start = cur[0]["start"]
+                end = cur[-1]["end"]
+                heading_path = next((x["heading_path"] for x in reversed(cur) if x.get("heading_path")), None)
+                chunks.append({
+                    "content": content,
+                    "start": start,
+                    "end": end,
+                    "heading_path": heading_path,
+                })
+            cur = []
+            cur_tokens = 0
+            continue  # 继续处理下一个段落
+
+        # 正常情况：可以添加到当前chunk
         if cur_tokens + p_tokens <= chunk_tokens or not cur:
             cur.append(p)
             cur_tokens += p_tokens
             i += 1
         else:
-            # emit current chunk
+            # 提交当前chunk
             content = "\n\n".join(x["content"] for x in cur)
             start = cur[0]["start"]
             end = cur[-1]["end"]
@@ -293,21 +330,32 @@ def _chunk_paragraphs(paragraphs: List[Dict], chunk_tokens: int, overlap_tokens:
                 "end": end,
                 "heading_path": heading_path,
             })
-            # build overlap by keeping tail tokens
+
+            # 构建重叠部分
             if overlap_tokens > 0 and cur:
                 kept: List[Dict] = []
                 kept_tokens = 0
+                # 从后向前收集段落，直到达到overlap_tokens
                 for x in reversed(cur):
                     t = _approx_token_len(x["content"]) or 1
-                    if kept_tokens + t > overlap_tokens:
+                    # 确保至少保留一个段落，避免死循环
+                    if kept_tokens + t > overlap_tokens and kept:
                         break
                     kept.append(x)
                     kept_tokens += t
+
+                # 如果kept为空，至少保留最后一个段落防止死循环
+                if not kept and cur:
+                    kept = [cur[-1]]
+                    kept_tokens = _approx_token_len(cur[-1]["content"]) or 1
+
                 cur = list(reversed(kept))
                 cur_tokens = kept_tokens
             else:
                 cur = []
                 cur_tokens = 0
+
+    # 处理最后剩余的段落
     if cur:
         content = "\n\n".join(x["content"] for x in cur)
         start = cur[0]["start"]
@@ -319,6 +367,7 @@ def _chunk_paragraphs(paragraphs: List[Dict], chunk_tokens: int, overlap_tokens:
             "end": end,
             "heading_path": heading_path,
         })
+
     return chunks
 
 
