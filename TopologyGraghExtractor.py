@@ -29,6 +29,7 @@ class TopologyGraphExtractor:
         self.topology_order = [] # 拓扑图排序
         self.java_resources = {} # 资源文件
         self.xml_resources = {} # 资源文件
+        # 强连通分量分组（有环的文件会被压缩到同一组），组按组件DAG顺序排列
         self.topology_groups = []
 
     def _scan_project(self):
@@ -188,12 +189,18 @@ class TopologyGraphExtractor:
         self._component_extraction()
         self._analyze_dependencies()
 
+        # 仅考虑支持类型Java文件作为图节点
         all_nodes = set(self.support_java_dependency.keys())
 
+        # 构建邻接表：deps_adj[A] = {B1, B2, ...} 表示 A 依赖 B1、B2（只保留项目内节点）
         deps_adj = {}
         for a, deps in self.support_java_dependency.items():
             deps_adj[a] = {b for b in deps if b in all_nodes}
 
+        # Tarjan算法求强连通分量（SCC）：
+        # - indices/lowlink 用于记录DFS序号与能回溯到的最小序号
+        # - stack/on_stack 维护当前SCC候选集合
+        # - sccs 记录所有SCC分组
         index_counter = [0]
         stack = []
         on_stack = set()
@@ -201,6 +208,7 @@ class TopologyGraphExtractor:
         lowlink = {}
         sccs = []
 
+        # Tarjan核心递归
         def strongconnect(v):
             indices[v] = index_counter[0]
             lowlink[v] = index_counter[0]
@@ -223,15 +231,19 @@ class TopologyGraphExtractor:
                         break
                 sccs.append(comp)
 
+        # 对所有节点执行强连通分量分解
         for node in all_nodes:
             if node not in indices:
                 strongconnect(node)
 
+        # 将每个节点映射到其所属的SCC组件编号
         comp_id = {}
         for i, comp in enumerate(sccs):
             for n in comp:
                 comp_id[n] = i
 
+        # 基于SCC构建组件图（DAG）：
+        # 若 A 依赖 B，则添加边 B -> A（保证先处理依赖，再处理被依赖）
         comp_graph = defaultdict(set)
         comp_in_degree = defaultdict(int)
         for i in range(len(sccs)):
@@ -244,6 +256,7 @@ class TopologyGraphExtractor:
                     comp_graph[cb].add(ca)
                     comp_in_degree[ca] += 1
 
+        # 对组件图执行Kahn拓扑排序，得到组件处理顺序
         comp_queue = deque()
         for i in range(len(sccs)):
             if comp_in_degree[i] == 0:
@@ -258,15 +271,18 @@ class TopologyGraphExtractor:
                 if comp_in_degree[nj] == 0:
                     comp_queue.append(nj)
 
+        # 组件内排序：优先处理出度（依赖数量）较少的文件，其次按路径字典序稳定
         groups_ordered = []
         for ci in ordered_comps:
             group = sorted(sccs[ci], key=lambda n: (len(deps_adj.get(n, set())), n))
             groups_ordered.append(group)
 
+        # 将组件顺序平铺为线性序列，提供给主流程使用
         flattened = []
         for g in groups_ordered:
             flattened.extend(g)
 
+        # 保留组与线性序列；若存在环仅提示，不返回None以保证流程可继续
         self.topology_groups = groups_ordered
         self.topological_order = flattened
         cyclic_groups = sum(1 for g in groups_ordered if len(g) > 1)
