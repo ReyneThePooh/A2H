@@ -73,7 +73,7 @@ class InteractionAnalyzeAgent(Agent):
         )
 
         messages = [{"role": "user", "content": prompt}]
-        response = self.llm.invoke(messages, **kwargs)
+        response = self.llm.invoke(messages)
         return response
 
     def analyze_layouts(self, java_dict_str: str, **kwargs) -> list[str]:

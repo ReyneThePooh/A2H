@@ -1,26 +1,20 @@
 from TopologyGraghExtractor import *
 from hello_agents.agents.java_translate_agent import *
-from hello_agents.agents.resource_analyze_agent import *
-
+from hello_agents.agents.code_reflection_agent import *
 
 if __name__ == '__main__':
-    # project_dir = 'D:\projects\\uitranslate\diary-1.0.1'
-    # extractor = TopologyGraphExtractor(project_dir)
-    # order = extractor.build_topological_order() # 构建拓扑排序
-    #
-    # print(order) # list
-    # print(extractor.support_java_paths)
-    # print(extractor.interaction_java_paths)
-    # print(extractor.component)
-    # print(extractor.support_java_dependency)
-    # print(extractor.interaction_java_dependency)
-
-    order = ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\TimeUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\BaseBean.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\SizeUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\db\\DbHelper.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\DiaryDataSource.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\impl\\DiaryDataSourceImpl.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\Mapp.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\AppUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\ToastUtils.java']
-    support_java_paths = {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\Mapp.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\BaseBean.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\DiaryDataSource.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\TimeUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\SizeUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\impl\\DiaryDataSourceImpl.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\db\\DbHelper.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\AppUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\ToastUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java'}
-    interaction_java_paths = {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\BaseActivity.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\MainActivity.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryBrowseActivity.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\adapter\\DiaryRecyclerAdapter.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryEditActivity.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryListActivity.java'}
-    component = [{'description': '基础Activity类', 'java_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\BaseActivity.java'], 'xml_files': []}, {'description': '主页面', 'java_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\MainActivity.java'], 'xml_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\res\\layout\\activity_main.xml']}, {'description': '日记列表页面', 'java_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryListActivity.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\adapter\\DiaryRecyclerAdapter.java'], 'xml_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\res\\layout\\activity_diary_list.xml', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\res\\layout\\item_recycler_diary.xml']}, {'description': '日记浏览页面', 'java_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryBrowseActivity.java'], 'xml_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\res\\layout\\activity_diary_browse.xml', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\res\\menu\\menu_diary_browse.xml']}, {'description': '日记编辑页面', 'java_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryEditActivity.java'], 'xml_files': ['D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\res\\layout\\activity_diary_edit.xml', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\res\\menu\\menu_diary_create.xml']}]
-    support_java_dependency = {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\Mapp.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\db\\DbHelper.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\DiaryDataSource.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\impl\\DiaryDataSourceImpl.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\BaseBean.java': set(), 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\DiaryDataSource.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\TimeUtils.java': set(), 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\SizeUtils.java': set(), 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\impl\\DiaryDataSourceImpl.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\db\\DbHelper.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\data\\DiaryDataSource.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\db\\DbHelper.java': set(), 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\AppUtils.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\Mapp.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\ToastUtils.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\Mapp.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\BaseBean.java'}}
-    interaction_java_dependency = {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\BaseActivity.java': set(), 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\MainActivity.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\AppUtils.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryBrowseActivity.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\Mapp.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\ToastUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\adapter\\DiaryRecyclerAdapter.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\TimeUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryEditActivity.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\ToastUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\Mapp.java'}, 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\ui\\DiaryListActivity.java': {'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\Mapp.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\utils\\SizeUtils.java', 'D:\\projects\\uitranslate\\diary-1.0.1\\app\\src\\main\\java\\com\\app\\diary\\bean\\Diary.java'}}
+    project_dir = 'C:\\Users\\dpq\\Desktop\\test app\\AndroidTVMovieParadise-master'
+    extractor = TopologyGraphExtractor(project_dir)
+    order = extractor.build_topological_order() # 构建拓扑排序
+    support_java_dependency = extractor.support_java_dependency
+    component = extractor.component
+    interaction_java_dependency = extractor.interaction_java_dependency
+    print(order) # list
+    print(extractor.support_java_paths)
+    print(extractor.interaction_java_paths)
+    print(extractor.component)
+    print(extractor.support_java_dependency)
+    print(extractor.interaction_java_dependency)
 
     java_to_ets = {}
     for java_path in order:
@@ -53,7 +47,7 @@ if __name__ == '__main__':
 
             # 调用翻译
             try:
-                response = pe.run(java_code, dependency=dependency, rule_path='JavaToArkTS.md')
+                response = pe.run(java_code, dependency=dependency)
                 print('响应结果如下')
                 print(response)
             except Exception as e:
@@ -159,7 +153,7 @@ if __name__ == '__main__':
 
             # 调用翻译
             try:
-                response = pe.run(java_code, rule_path='JavaToArkTS.md', xml_code=xml_code, dependency=dependency)
+                response = pe.run(java_code, xml_code=xml_code, dependency=dependency)
             except Exception as e:
                 print(f"❌ 翻译失败: {e}")
                 continue
@@ -207,5 +201,31 @@ if __name__ == '__main__':
     print(f"✅ 成功翻译的Java文件数: {len(java_to_ets)}")
     print(f"{'=' * 60}")
 
+    load_dotenv()
+    config = Config.from_env()
+    llm = HelloAgentsLLM()
 
+    agent = HarmonyFeedbackAgent(
+        llm=llm,
+        config=config,
+        max_iterations=3
+    )
+
+    result = agent.run()
+
+    print("\n" + "=" * 70)
+    print("🎯 最终结果")
+    print("=" * 70)
+
+    if result.get('success'):
+        print("🎉 所有错误已修复！")
+        print(f"总共修复了 {result.get('total_errors_fixed')} 个错误")
+        print(f"迭代次数: {result.get('iterations')}")
+    else:
+        print(f"⚠️ 仍有 {result.get('remaining_errors_count', 0)} 个错误未解决")
+        print("建议：检查剩余错误，可能需要人工介入")
+        if result.get('final_errors'):
+            print("\n剩余错误:")
+            for i, err in enumerate(result['final_errors'][:3], 1):
+                print(f"  {i}. {err.get('file')} L{err.get('line')}: {err.get('message')}")
 

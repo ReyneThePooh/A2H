@@ -29,6 +29,7 @@ class TopologyGraphExtractor:
         self.topology_order = [] # 拓扑图排序
         self.java_resources = {} # 资源文件
         self.xml_resources = {} # 资源文件
+        self.topology_groups = []
 
     def _scan_project(self):
         """
@@ -187,66 +188,92 @@ class TopologyGraphExtractor:
         self._component_extraction()
         self._analyze_dependencies()
 
-        # 所有纯Java文件（不与XML关联的）
         all_nodes = set(self.support_java_dependency.keys())
 
-        # 构建图的邻接表和入度表
-        # graph[A] = [B1, B2, ...] 表示 A->B1, A->B2（B1、B2依赖A）
-        graph = defaultdict(list)
-        in_degree = defaultdict(int)
+        deps_adj = {}
+        for a, deps in self.support_java_dependency.items():
+            deps_adj[a] = {b for b in deps if b in all_nodes}
 
-        # 初始化所有节点的入度为0
+        index_counter = [0]
+        stack = []
+        on_stack = set()
+        indices = {}
+        lowlink = {}
+        sccs = []
+
+        def strongconnect(v):
+            indices[v] = index_counter[0]
+            lowlink[v] = index_counter[0]
+            index_counter[0] += 1
+            stack.append(v)
+            on_stack.add(v)
+            for w in deps_adj.get(v, set()):
+                if w not in indices:
+                    strongconnect(w)
+                    lowlink[v] = lowlink[v] if lowlink[v] < lowlink[w] else lowlink[w]
+                elif w in on_stack:
+                    lowlink[v] = lowlink[v] if lowlink[v] < indices[w] else indices[w]
+            if lowlink[v] == indices[v]:
+                comp = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                sccs.append(comp)
+
         for node in all_nodes:
-            in_degree[node] = 0
+            if node not in indices:
+                strongconnect(node)
 
-        # 构建图：A依赖B，则B->A（B指向A）
-        for java_file, dependencies in self.support_java_dependency.items():
-            for dep in dependencies:
-                # 只考虑在all_nodes中的依赖（项目内的纯Java文件）
-                if dep in all_nodes:
-                    # dep -> java_file (java_file依赖dep，所以dep指向java_file)
-                    graph[dep].append(java_file)
-                    in_degree[java_file] += 1
+        comp_id = {}
+        for i, comp in enumerate(sccs):
+            for n in comp:
+                comp_id[n] = i
 
-        # Kahn算法：找出所有入度为0的节点（没有依赖其他节点的节点）
-        queue = deque()
-        for node in all_nodes:
-            if in_degree[node] == 0:
-                queue.append(node)
+        comp_graph = defaultdict(set)
+        comp_in_degree = defaultdict(int)
+        for i in range(len(sccs)):
+            comp_in_degree[i] = 0
+        for a in all_nodes:
+            ca = comp_id[a]
+            for b in deps_adj.get(a, set()):
+                cb = comp_id[b]
+                if ca != cb and ca not in comp_graph[cb]:
+                    comp_graph[cb].add(ca)
+                    comp_in_degree[ca] += 1
 
-        topological_order = []
+        comp_queue = deque()
+        for i in range(len(sccs)):
+            if comp_in_degree[i] == 0:
+                comp_queue.append(i)
 
-        while queue:
-            # 取出入度为0的节点
-            current = queue.popleft()
-            topological_order.append(current)
+        ordered_comps = []
+        while comp_queue:
+            ci = comp_queue.popleft()
+            ordered_comps.append(ci)
+            for nj in comp_graph[ci]:
+                comp_in_degree[nj] -= 1
+                if comp_in_degree[nj] == 0:
+                    comp_queue.append(nj)
 
-            # 遍历当前节点指向的所有邻居节点
-            for neighbor in graph[current]:
-                in_degree[neighbor] -= 1
-                # 如果邻居入度变为0，加入队列
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
+        groups_ordered = []
+        for ci in ordered_comps:
+            group = sorted(sccs[ci], key=lambda n: (len(deps_adj.get(n, set())), n))
+            groups_ordered.append(group)
 
-        # 检查是否存在循环依赖
-        if len(topological_order) != len(all_nodes):
-            # 找出循环依赖的节点
-            remaining_nodes = all_nodes - set(topological_order)
-            print(f"⚠️ 检测到循环依赖，涉及 {len(remaining_nodes)} 个节点")
+        flattened = []
+        for g in groups_ordered:
+            flattened.extend(g)
 
-            # 打印循环依赖的详细信息
-            for node in remaining_nodes:
-                deps_in_cycle = self.support_java_dependency[node] & remaining_nodes
-                if deps_in_cycle:
-                    print(f"  - {node}")
-                    print(f"    依赖: {deps_in_cycle}")
-
-            return None
-
-        # 保存拓扑序列
-        self.topological_order = topological_order
-        print(f"✅ 拓扑排序成功，共 {len(topological_order)} 个支持类型Java文件")
-        return topological_order
+        self.topology_groups = groups_ordered
+        self.topological_order = flattened
+        cyclic_groups = sum(1 for g in groups_ordered if len(g) > 1)
+        if cyclic_groups > 0:
+            print(f"⚠️ 检测到循环依赖，合并为 {cyclic_groups} 个强连通分量")
+        print(f"✅ 拓扑排序成功，共 {len(flattened)} 个支持类型Java文件")
+        return flattened
 
 if __name__ == "__main__":
     project_dir = 'D:\projects\\uitranslate\diary-1.0.1'

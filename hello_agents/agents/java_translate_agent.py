@@ -10,12 +10,12 @@ from ..core.message import Message
 
 # 规划器提示词
 DEFAULT_PLANNER_PROMPT = """
-你是一个顶级的代码翻译规划专家。你的任务是将Java代码和XML布局代码翻译成ArkTS代码的过程分解成一个由多个简单步骤组成的行动计划。
+你是一个顶级的代码翻译规划专家。你的任务是将Java代码和XML布局代码翻译成ArkTS代码的过程分解成一个由多个简单步骤组成的行动计划，并识别需要参考的知识文件。
 
 完整Java代码:
 {java_code}
 
-完整XML代码(可能为空):
+XML代码(可能为空):
 {xml_code}
 
 翻译上下文信息:
@@ -51,12 +51,30 @@ DEFAULT_PLANNER_PROMPT = """
     步骤4: 翻译build()方法,将XML布局转换为声明式UI(Column/Row/List等)
     步骤5: 翻译事件处理方法(onClick等)和生命周期方法(aboutToAppear等)
 
+知识文件使用原则:
+  1. **匹配代码特征**: 根据Java/XML代码的特征选择相关知识点
+  2. **按需引用**: 只在步骤确实需要相关知识时才引用
+  3. **层级引用**: 基础语法优先,组件和布局其次,高级特性最后
+  4. **避免冗余**: 不要引用明显不相关的知识文件
+  5. **严格限制**: 只能使用下面列出的知识文件路径,不得自行编造
+
+可用知识文件列表（仅限以下文件）:
+  - D:\projects\HelloAgents-main\knowledge\syntax.md (ArkTS基础语法)
+  - D:\projects\HelloAgents-main\knowledge\data.md (数据库相关)
+
 规划原则:
   1. **避免过度拆分**: 相关的代码应该合并到一个步骤中
   2. **功能聚合**: 同类型的方法可以放在一个步骤中一起翻译
   3. **依赖优先**: 被调用的函数应该先于调用它的函数翻译
   4. **协同翻译**: XML和Java必须协同分析,UI组件在build()中统一处理
   5. **步骤精简**: 总步骤数控制在3-8步,避免超过10步
+  6. **步骤描述简洁**: 步骤描述只说明要翻译什么内容,不说明具体翻译方法或API转换细节
+
+步骤描述要求:
+  - ❌ 不好的描述(包含具体转换细节): "翻译getSimpleTime方法，将Java的SimpleDateFormat和Calendar转换为ArkTS的DateTime和TimeUtil"
+  - ✅ 好的描述(只说明翻译内容): "翻译getSimpleTime方法"
+  - ❌ 不好的描述(过于详细): "翻译XML布局中的LinearLayout为Column，TextView为Text"
+  - ✅ 好的描述(简洁): "翻译UI布局相关代码"
 
 步骤合并示例:
   ❌ 不好的拆分(步骤过多):
@@ -72,14 +90,16 @@ DEFAULT_PLANNER_PROMPT = """
   ✅ 好的拆分(步骤合并):
     - 步骤1: 翻译导入语句和类声明
     - 步骤2: 翻译成员变量和常量
-    - 步骤3: 翻译数据处理相关方法(getData/setData/processData)
-    - 步骤4: 翻译UI初始化和更新方法(initView/updateUI)
+    - 步骤3: 翻译数据处理相关方法
+    - 步骤4: 翻译UI初始化和更新方法
 
 注意事项:
   1. 支持类(工具类/数据模型)不需要详细拆分,3-4步即可完成
   2. 交互类(Activity/Fragment/Adapter)应控制在5-8步以内
-  3. 步骤描述要明确但不要过于细节
+  3. 步骤描述要简洁明确,只说明要翻译的内容,不包含具体转换细节
   4. 将Java代码和XML代码翻译为一个对应的ArkTS代码文件(.ets)
+  5. 知识文件列表只能从"可用知识文件列表"中选择,不能添加其他路径
+  6. 知识文件数量要合理,通常1-3个,最多不超过3个
   
 不应出现以下计划:
   - 翻译Java包声明
@@ -88,24 +108,44 @@ DEFAULT_PLANNER_PROMPT = """
   - 每个import一个步骤
   - 每个变量一个步骤
   - 每个方法一个步骤
+  - 引用不在"可用知识文件列表"中的路径
+  - 编造不存在的知识文件路径
+  - 步骤描述中包含具体的API转换细节
 
-输出格式示例(交互类):
-```python
-["步骤1: 翻译导入语句和类声明为@Entry @Component",
- "步骤2: 分析XML布局和Java的findViewById引用,翻译状态变量(@State)和成员变量",
- "步骤3: 翻译数据处理和验证相关方法",
- "步骤4: 翻译build()方法,将XML布局转换为声明式UI(Column/Row/List等容器及子组件)",
- "步骤5: 翻译事件处理方法(onClick/onTouch等)和生命周期方法(aboutToAppear等)"]
-```
+输出格式:
+你的输出必须是有效的JSON对象,包含两个字段:
+1. "plan": 字符串数组,包含翻译步骤计划
+2. "knowledge_files": 字符串数组,包含需要参考的知识文件路径（必须从上面的"可用知识文件列表"中选择）
 
-输出格式示例(支持类):
-```python
-["步骤1: 翻译导入语句和工具类声明",
- "步骤2: 翻译常量定义和静态变量",
- "步骤3: 翻译所有工具方法,包括时间格式化、字符串处理等功能"]
-```
- 
-请严格按照上述格式和策略输出你的翻译计划,确保步骤数量合理(3-8步):
+输出示例(交互类):
+{{
+  "plan": [
+    "步骤1: 翻译导入语句和类声明",
+    "步骤2: 翻译状态变量和成员变量",
+    "步骤3: 翻译数据处理和工具方法",
+    "步骤4: 翻译UI布局代码",
+    "步骤5: 翻译事件处理和生命周期方法"
+  ],
+  "knowledge_files": [
+    "D:\projects\HelloAgents-main\knowledge\syntax.md "
+  ]
+}}
+
+输出示例(支持类):
+{{
+  "plan": [
+    "步骤1: 翻译导入语句和类声明",
+    "步骤2: 翻译常量和静态变量",
+    "步骤3: 翻译工具方法"
+  ],
+  "knowledge_files": [
+    "D:\projects\HelloAgents-main\knowledge\syntax.md "
+  ]
+}}
+
+重要提示: 
+1. knowledge_files数组中的所有路径必须严格来自"可用知识文件列表",不能包含其他路径。如果代码不需要参考知识文件,可以返回空数组[]。
+2. 步骤描述要简洁,只说明翻译什么内容,不包含具体API转换细节或实现方法。
 """
 
 # 默认执行器提示词模板
@@ -118,7 +158,7 @@ DEFAULT_EXECUTOR_PROMPT = """
 # 相关依赖代码
 {dependency}
 
-# 参考转换规则
+# 相关知识
 {rule_map}
 
 # 完整Java代码:
@@ -154,32 +194,6 @@ DEFAULT_EXECUTOR_PROMPT = """
   8. 所有翻译结果应合并到同一个.ets文件中
   9. 当前步骤可能包含多个方法或多个变量,请全部翻译完成
 
-### 资源引用处理规则
-  遇到Android资源引用时,使用占位符标记,格式如下:
-
-  **字符串资源**: 
-  - R.string.xxx → `/* TODO_RESOURCE: R.string.xxx */`
-  - 示例: `Text(/* TODO_RESOURCE: R.string.app_name */)`
-
-  **颜色资源**: 
-  - R.color.xxx → `/* TODO_RESOURCE: R.color.xxx */`
-  - 示例: `.backgroundColor(/* TODO_RESOURCE: R.color.primary */)`
-
-  **尺寸资源**: 
-  - R.dimen.xxx → `/* TODO_RESOURCE: R.dimen.xxx */`
-  - 示例: `.width(/* TODO_RESOURCE: R.dimen.button_width */)`
-
-  **图片资源**: 
-  - R.drawable.xxx → `/* TODO_RESOURCE: R.drawable.xxx */`
-  - 示例: `Image(/* TODO_RESOURCE: R.drawable.icon */)`
-
-  **Drawable XML**: 
-  - @drawable/xxx → `/* TODO_RESOURCE: @drawable/xxx */`
-  - 示例: `.background(/* TODO_RESOURCE: @drawable/button_bg */)`
-
-  **布局资源**:
-  - R.layout.xxx → `/* TODO_RESOURCE: R.layout.xxx */`
-  - 注释说明该布局的用途
 
 ### 代码结构规范
   1. **纯Java类翻译**:
@@ -208,7 +222,7 @@ DEFAULT_EXECUTOR_PROMPT = """
   3. XML布局必须在build()方法中转换为声明式UI
   4. 事件监听器需要正确绑定到UI组件
   5. 数据绑定需要使用@State等装饰器
-  6. 所有资源引用必须用TODO_RESOURCE标记
+  6. 所有资源引用自行填充
 
 ---
 
@@ -238,7 +252,7 @@ class Planner:
         self.llm_client = llm_client
         self.prompt_template = prompt_template if prompt_template else DEFAULT_PLANNER_PROMPT
 
-    def plan(self, java_code: str, **kwargs) -> List[str]:
+    def plan(self, java_code: str, **kwargs) -> Dict:
         """
         生成执行计划
 
@@ -252,24 +266,25 @@ class Planner:
         xml_code = kwargs.get('xml_code', "")
         prompt = self.prompt_template.format(java_code=java_code, xml_code=xml_code)
         messages = [{"role": "user", "content": prompt}]
+        print("规划器提示词如下：")
+        print(prompt)
 
         print("--- 正在生成计划 ---")
         response_text = self.llm_client.invoke(messages) or ""
         print(f"✅ 计划已生成:\n{response_text}")
 
         try:
-            plan_str = response_text.split("```python")[1].split("```")[0].strip() \
-                if "```python" in response_text else response_text.strip()
+            plan_str = response_text.split("```json")[1].split("```")[0].strip() \
+                if "```json" in response_text else response_text.strip()
             plan = ast.literal_eval(plan_str)
-            plan = ast.literal_eval(plan_str)
-            return plan if isinstance(plan, list) else []
+            return plan if isinstance(plan, dict) else {}
         except (ValueError, SyntaxError, IndexError) as e:
             print(f"❌ 解析计划时出错: {e}")
             print(f"原始响应: {response_text}")
-            return []
+            return {}
         except Exception as e:
             print(f"❌ 解析计划时发生未知错误: {e}")
-            return []
+            return {}
 
 
 class Executor:
@@ -311,7 +326,8 @@ class Executor:
                 current_step=step
             )
             messages = [{"role": "user", "content": prompt}]
-
+            print("翻译器提示词如下:")
+            print(prompt)
             response_text = self.llm_client.invoke(messages) or ""
             print(f'步骤{i}翻译所得代码：')
             print(response_text)
@@ -411,10 +427,14 @@ class PlanAndSolveAgent(Agent):
         dependency = kwargs.get("dependency", "")
         xml_code = kwargs.get("xml_code", "")
 
-        plan = self.planner.plan(java_code, **kwargs)
-        rule_path = kwargs.get("rule_path", "")
-        with open(rule_path, "r", encoding="utf-8") as f:
-            rule_map = f.read()
+        plan_dict = self.planner.plan(java_code, xml_code=xml_code)
+        plan = plan_dict.get("plan", [])
+        rule_paths = plan_dict.get("knowledge_files", "")
+
+        rule_map = ""
+        for rule_path in rule_paths:
+            with open(rule_path, "r", encoding="utf-8") as f:
+                rule_map += f.read()
 
 
 
