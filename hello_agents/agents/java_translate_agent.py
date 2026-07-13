@@ -1,15 +1,17 @@
 """Plan and Solve Agent实现 - 分解规划与逐步执行的智能体"""
 import ast
 import json
+from pathlib import Path
 from typing import Optional, List, Dict
 from ..core.agent import Agent
 from ..core.llm import HelloAgentsLLM
 from ..core.config import Config
 from ..core.message import Message
+from ..core.path_config import KNOWLEDGE_DIR
 
 
 # 规划器提示词
-DEFAULT_PLANNER_PROMPT = """
+DEFAULT_PLANNER_PROMPT = r"""
 你是一个顶级的代码翻译规划专家。你的任务是将Java代码和XML布局代码翻译成ArkTS代码的过程分解成一个由多个简单步骤组成的行动计划，并识别需要参考的知识文件。
 
 完整Java代码:
@@ -150,6 +152,15 @@ XML代码(可能为空):
 
 # 默认执行器提示词模板
 # 执行器提示词模板
+KNOWLEDGE_SYNTAX_PATH = str((KNOWLEDGE_DIR / "syntax.md").resolve())
+KNOWLEDGE_DATA_PATH = str((KNOWLEDGE_DIR / "data.md").resolve())
+
+DEFAULT_PLANNER_PROMPT = (
+    DEFAULT_PLANNER_PROMPT
+    .replace(r"D:\projects\HelloAgents-main\knowledge\syntax.md", KNOWLEDGE_SYNTAX_PATH)
+    .replace(r"D:\projects\HelloAgents-main\knowledge\data.md", KNOWLEDGE_DATA_PATH)
+)
+
 DEFAULT_EXECUTOR_PROMPT = """
 你是一位顶级的Java到ArkTS代码翻译专家。你的任务是严格按照给定的翻译计划，逐步将Java代码翻译成ArkTS代码。
 你将收到完整的Java代码、XML代码(可能为空)、已完成的翻译步骤及其结果、以及当前需要执行的翻译步骤。
@@ -370,6 +381,23 @@ class Executor:
             return {"code": "", "address": ""}
 
 
+def _resolve_knowledge_path(rule_path: str) -> Path:
+    path = Path(str(rule_path).strip().strip("\"'"))
+    if path.exists():
+        return path
+
+    if not path.is_absolute():
+        candidate = KNOWLEDGE_DIR / path
+        if candidate.exists():
+            return candidate
+
+    candidate = KNOWLEDGE_DIR / path.name
+    if candidate.exists():
+        return candidate
+
+    return path
+
+
 class PlanAndSolveAgent(Agent):
     """
     Plan and Solve Agent - 分解规划与逐步执行的智能体
@@ -433,7 +461,7 @@ class PlanAndSolveAgent(Agent):
 
         rule_map = ""
         for rule_path in rule_paths:
-            with open(rule_path, "r", encoding="utf-8") as f:
+            with open(_resolve_knowledge_path(rule_path), "r", encoding="utf-8") as f:
                 rule_map += f.read()
 
 

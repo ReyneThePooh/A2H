@@ -1,9 +1,25 @@
+import json
+import os
+from pathlib import Path
+
 from TopologyGraghExtractor import *
 from hello_agents.agents.java_translate_agent import *
 from hello_agents.agents.code_reflection_agent import *
+from hello_agents.core.path_config import ANDROID_PROJECT_DIR, HARMONY_SOURCE_PROJECT_DIR
+
+
+def resolve_output_path(address):
+    path = Path(address)
+    if path.is_absolute():
+        return path
+
+    parts = path.parts
+    if parts and parts[0] == HARMONY_SOURCE_PROJECT_DIR.name:
+        path = Path(*parts[1:])
+    return HARMONY_SOURCE_PROJECT_DIR / path
 
 if __name__ == '__main__':
-    project_dir = 'C:\\Users\\dpq\\Desktop\\test app\\AndroidTVMovieParadise-master'
+    project_dir = str(ANDROID_PROJECT_DIR)
     extractor = TopologyGraphExtractor(project_dir)
     order = extractor.build_topological_order() # 构建拓扑排序
     support_java_dependency = extractor.support_java_dependency
@@ -75,15 +91,17 @@ if __name__ == '__main__':
 
             # 创建目录并写入文件
             try:
-                directory = os.path.dirname(address)
+                target_path = resolve_output_path(address)
+                directory = os.path.dirname(target_path)
                 if directory and not os.path.exists(directory):
                     os.makedirs(directory, exist_ok=True)
                     print(f"✅ 创建目录: {directory}")
 
-                with open(address, 'w', encoding='utf-8') as f:
+                with open(target_path, 'w', encoding='utf-8') as f:
                     f.write(code)
 
-                print(f"✅ 代码已写入: {address}")
+                print(f"✅ 代码已写入: {target_path}")
+                result["address"] = str(target_path)
                 java_to_ets[java_path] = result
 
             except Exception as e:
@@ -175,15 +193,16 @@ if __name__ == '__main__':
 
             # 创建目录并写入文件
             try:
-                directory = os.path.dirname(address)
+                target_path = resolve_output_path(address)
+                directory = os.path.dirname(target_path)
                 if directory and not os.path.exists(directory):
                     os.makedirs(directory, exist_ok=True)
                     print(f"✅ 创建目录: {directory}")
 
-                with open(address, 'w', encoding='utf-8') as f:
+                with open(target_path, 'w', encoding='utf-8') as f:
                     f.write(code)
 
-                print(f"✅ 代码已写入: {address}")
+                print(f"✅ 代码已写入: {target_path}")
 
             except Exception as e:
                 print(f"❌ 写入文件失败 {address}: {e}")
