@@ -159,3 +159,23 @@ cython_debug/
 #.idea/
 .DS_Store
 .obsidian
+
+# Local IDE/workspace settings
+.vscode/
+
+# Local virtual environments and build caches
+.venv/
+.hvigor/
+
+# Temporary/experimental helper scripts.
+# Put stable, reusable scripts under scripts/ instead.
+tools/
+
+# Runtime work directories and generated conversion/check artifacts
+HCW/
+HarmonyCheckWorkDir/
+HarmonyCheckWorkDir_*/
+
+# Packaged/generated outputs
+outputs/
+artifacts/
