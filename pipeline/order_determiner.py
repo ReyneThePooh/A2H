@@ -5,8 +5,6 @@ import json
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
-from collections import deque, defaultdict
-
 from openai import OpenAI
 
 from analyzers.static import (
@@ -16,6 +14,10 @@ from analyzers.static import (
     analyze_file,
 )
 from analyzers.tools import ToolRegistry, _summary_to_dict
+from pipeline.static_graph import (
+    norm_path, build_file_graph, build_hard_groups,
+    layered_topological_sort, validate_plan, export_artifacts,
+)
 
 
 # ============================================================
@@ -119,7 +121,7 @@ def scan_project(project_path: str, src_dir: str = "app/src/main") -> dict[str, 
     files = {}
     for ext in ['*.java', '*.xml']:
         for f in root.rglob(ext):
-            rel = str(f.relative_to(root))
+            rel = norm_path(f.relative_to(root))
             try:
                 files[rel] = f.read_text(encoding='utf-8')
             except Exception:
@@ -156,6 +158,9 @@ class SummaryGenerator:
         if cache_path and os.path.exists(cache_path):
             cached = self._load_cache(cache_path)
             if cached:
+                # 旧缓存可能缺少新增的静态字段（type_references 等），用零 token 的静态分析补齐
+                if self._refresh_static_fields(cached, files):
+                    self._save_cache(cached, cache_path)
                 return cached
 
         # 第一阶段：静态分析（零 token）
@@ -310,6 +315,28 @@ class SummaryGenerator:
             print(f"      ⚠️ LLM 摘要生成失败: {e}")
 
     @staticmethod
+    def _refresh_static_fields(summaries: dict, files: dict[str, str]) -> bool:
+        """为旧版缓存补齐新增的静态字段（type_references / intent_targets），零 token"""
+        refreshed = False
+        for path, s in summaries.items():
+            if not isinstance(s, FileSummary):
+                continue
+            if s.type_references or s.intent_targets:
+                continue
+            code = files.get(path) or files.get(norm_path(path))
+            if not code:
+                continue
+            fresh = JavaStaticAnalyzer.analyze(path, code)
+            s.type_references = fresh.type_references
+            s.intent_targets = fresh.intent_targets
+            if not s.resource_refs:
+                s.resource_refs = fresh.resource_refs
+            refreshed = True
+        if refreshed:
+            print("  已为缓存摘要补齐静态依赖字段")
+        return refreshed
+
+    @staticmethod
     def _parse_json(text: str) -> dict | None:
         """从 LLM 输出中解析 JSON"""
         text = text.strip()
@@ -417,6 +444,8 @@ class SummaryGenerator:
                     s.import_start = d.get("import_start", 0)
                     s.import_end = d.get("import_end", 0)
                     s.android_imports_count = d.get("android_imports_count", 0)
+                    s.type_references = d.get("type_references", [])
+                    s.intent_targets = d.get("intent_targets", [])
                     s.resource_refs = d.get("resource_refs", {})
                     s.lines = d.get("lines", 0)
                     s.methods = _restore_methods(d.get("methods", []))
@@ -478,6 +507,11 @@ class UnitBuilder:
 ## 任务
 根据项目的文件列表和摘要，将文件分组为翻译单元。
 
+## 硬绑定约束（必须遵守）
+输入中会给出"硬绑定组"——通过静态分析确定的强耦合文件组
+（如 Activity 与它 setContentView 的布局、Adapter 与它 inflate 的 item 布局、布局与它 include 的子布局）。
+每个硬绑定组内的文件必须放在同一个单元中，不允许拆散。可以把多个硬绑定组合并进同一个单元，但不能拆分。
+
 ## 输出格式
 请严格按照以下JSON格式输出（不要markdown包裹）：
 {
@@ -494,14 +528,21 @@ class UnitBuilder:
 注意：
 1. sources 必须是原始文件路径，与 get_all_summaries 中列出的路径一致
 2. 每个文件必须且只能属于一个单元
-3. 确保所有文件都被分配到某个单元中"""
+3. 确保所有文件都被分配到某个单元中
+4. 硬绑定组内的文件必须在同一单元"""
 
     def __init__(self, llm: LLMClient, tools: ToolRegistry):
         self.llm = llm
         self.tools = tools
 
-    def build_units(self, java_files: list[str], xml_files: list[str]) -> list[Unit]:
-        """LLM 驱动的 unit 划分"""
+    def build_units(self, java_files: list[str], xml_files: list[str],
+                    hard_groups: list[list[str]] | None = None) -> list[Unit]:
+        """LLM 驱动的 unit 划分（受静态硬绑定约束）"""
+        hard_groups = hard_groups or []
+        hard_groups_text = "\n".join(
+            f"- 组{i + 1}: {', '.join(g)}" for i, g in enumerate(hard_groups)
+        ) or "（无）"
+
         messages = [
             {"role": "system", "content": self.UNIT_BUILDER_PROMPT},
             {"role": "user", "content": f"""请为以下项目划分翻译单元。
@@ -511,6 +552,9 @@ class UnitBuilder:
 
 ## XML 布局文件 ({len(xml_files)} 个)
 {chr(10).join(xml_files)}
+
+## 硬绑定组（组内文件必须同单元）
+{hard_groups_text}
 
 请先使用 get_all_summaries 了解全貌，然后对关键文件使用 get_file_summary 查看详情，最后输出单元划分。"""
              },
@@ -524,65 +568,135 @@ class UnitBuilder:
 
         data = SummaryGenerator._parse_json(result)
         if not data:
-            print("  ⚠️ LLM unit 划分解析失败，使用默认单文件单元")
-            return self._fallback_units(java_files, xml_files)
+            print("  ⚠️ LLM unit 划分解析失败，使用硬绑定分组兜底")
+            return self._fallback_units(java_files, xml_files, hard_groups)
 
+        all_files = [norm_path(f) for f in java_files + xml_files]
         units = []
         for u in data.get("units", []):
-            units.append(Unit(
-                name=u.get("name", "未命名"),
-                sources=u.get("sources", []),
-                description=u.get("description", ""),
-            ))
+            sources = self._normalize_sources(u.get("sources", []), all_files)
+            if sources:
+                units.append(Unit(
+                    name=u.get("name", "未命名"),
+                    sources=sources,
+                    description=u.get("description", ""),
+                ))
 
-        # 验证：检查文件覆盖
-        covered = set()
+        units = self._repair_units(units, all_files, hard_groups)
+        return units
+
+    @staticmethod
+    def _normalize_sources(sources: list[str], all_files: list[str]) -> list[str]:
+        """把 LLM 输出的路径规范化并匹配到真实文件；无法匹配的丢弃并告警"""
+        result = []
+        for src in sources:
+            src_n = norm_path(src)
+            if src_n in all_files:
+                result.append(src_n)
+                continue
+            # 结尾匹配（LLM 可能省略前缀目录）
+            matches = [f for f in all_files if f.endswith('/' + src_n) or f == src_n]
+            if len(matches) == 1:
+                result.append(matches[0])
+            else:
+                print(f"  ⚠️ LLM 输出了无法匹配的路径，已丢弃: {src}")
+        return result
+
+    def _repair_units(self, units: list[Unit], all_files: list[str],
+                      hard_groups: list[list[str]]) -> list[Unit]:
+        """修复 LLM 输出：去重、补漏、强制执行硬绑定约束"""
+        # 1. 去重：一个文件只保留在第一个出现的单元中
+        seen: set[str] = set()
         for u in units:
-            covered.update(u.sources)
-        all_files = set(java_files + xml_files)
-        missing = all_files - covered
+            deduped = []
+            for src in u.sources:
+                if src not in seen:
+                    seen.add(src)
+                    deduped.append(src)
+                else:
+                    print(f"  ⚠️ 文件被重复分配，保留首个单元: {src}")
+            u.sources = deduped
+
+        # 2. 补漏：未覆盖的文件创建单独单元
+        missing = set(all_files) - seen
         if missing:
             print(f"  ⚠️ LLM 遗漏 {len(missing)} 个文件，为它们创建单独单元")
             for f in sorted(missing):
-                units.append(Unit(
-                    name=Path(f).stem,
-                    sources=[f],
-                    description="自动补充"
-                ))
+                units.append(Unit(name=Path(f).stem, sources=[f], description="自动补充"))
 
-        return units
+        # 3. 硬绑定：组内文件若分散在多个单元，全部移入锚点单元（组内第一个 Java 文件所在单元）
+        file_to_unit: dict[str, Unit] = {}
+        for u in units:
+            for src in u.sources:
+                file_to_unit[src] = u
 
-    def _fallback_units(self, java_files: list[str], xml_files: list[str]) -> list[Unit]:
-        """兜底：每个文件一个单元"""
+        for group in hard_groups:
+            group_n = [norm_path(f) for f in group if norm_path(f) in file_to_unit]
+            if not group_n:
+                continue
+            owners = {id(file_to_unit[f]) for f in group_n}
+            if len(owners) <= 1:
+                continue
+            anchor_file = next((f for f in group_n if f.endswith('.java')), group_n[0])
+            anchor = file_to_unit[anchor_file]
+            print(f"  ⚠️ 硬绑定组被拆散，自动合并到单元 [{anchor.name}]: {group_n}")
+            for f in group_n:
+                current = file_to_unit[f]
+                if current is not anchor:
+                    current.sources.remove(f)
+                    anchor.sources.append(f)
+                    file_to_unit[f] = anchor
+
+        # 4. 清理空单元
+        return [u for u in units if u.sources]
+
+    def _fallback_units(self, java_files: list[str], xml_files: list[str],
+                        hard_groups: list[list[str]] | None = None) -> list[Unit]:
+        """兜底：按硬绑定分组成单元，剩余文件每个一个单元"""
+        hard_groups = hard_groups or []
+        all_files = [norm_path(f) for f in java_files + xml_files]
         units = []
-        for f in java_files:
-            units.append(Unit(name=Path(f).stem, sources=[f]))
-        for f in xml_files:
-            units.append(Unit(name=Path(f).stem, sources=[f]))
+        grouped: set[str] = set()
+
+        for g in hard_groups:
+            g_n = [norm_path(f) for f in g if norm_path(f) in all_files]
+            if not g_n:
+                continue
+            anchor = next((f for f in g_n if f.endswith('.java')), g_n[0])
+            units.append(Unit(name=Path(anchor).stem, sources=g_n))
+            grouped.update(g_n)
+
+        for f in all_files:
+            if f not in grouped:
+                units.append(Unit(name=Path(f).stem, sources=[f]))
         return units
 
 
 # ============================================================
-# 步骤 4: Unit 依赖分析（静态匹配 + LLM）
+# 步骤 4: Unit 依赖分析（静态文件图 + LLM 审核补充）
 # ============================================================
 
 class UnitDependencyAnalyzer:
-    """确定 unit 之间的依赖关系"""
+    """确定 unit 之间的依赖关系
 
-    DEPENDENCY_PROMPT = """你是一个Java项目依赖分析专家。你的任务是确定翻译单元之间的依赖关系。
+    静态第一遍：把文件级依赖图（类型引用 / import / Intent / 布局引用）投影到 unit 级，
+    覆盖同包无 import 的引用；LLM 第二遍只负责审核和补充静态无法确定的隐式依赖。
+    """
+
+    DEPENDENCY_PROMPT = """你是一个Java项目依赖分析专家。你的任务是审核并补充翻译单元之间的依赖关系。
 
 ## 背景
-已经通过静态分析完成了初步的依赖匹配（基于 import 语句）。但以下情况静态分析可能遗漏：
-1. 运行时通过 Intent 跳转到其他 Activity
-2. 通过反射或动态加载
-3. 隐式依赖（共享数据模型、全局状态）
+已经通过静态分析（AST 类型引用、import、Intent 跳转、布局引用）得到了初步依赖图。
+静态分析仍可能遗漏的情况：
+1. 通过反射、字符串类名动态加载
+2. 隐式协议依赖（共享 SharedPreferences key、广播 action、数据库表结构）
 
 ## 可用工具
 - get_file_summary: 查看文件详细摘要
 - read_file_region: 读取文件指定行
 
 ## 任务
-请确认/修正/补充单元间的依赖关系。
+基于给出的静态依赖结果，补充确实存在但被遗漏的依赖。不要删除静态分析得到的依赖。
 
 ## 输出格式
 严格按以下JSON格式输出：
@@ -595,53 +709,50 @@ class UnitDependencyAnalyzer:
 }
 
 注意：
-- 键是被依赖的单元名（depends_on）
-- 值列表中的单元名必须与输入中给定的完全一致
-- 只输出确实存在的依赖"""
+- 边方向：键是依赖方，值是它依赖的单元列表。"单元A": ["单元B"] 表示 A 依赖 B（B 必须先于 A 翻译）
+- 单元名必须与输入中给定的完全一致
+- 只输出确实存在的依赖，宁缺毋滥"""
 
-    def __init__(self, llm: LLMClient, tools: ToolRegistry, summaries: dict):
+    def __init__(self, llm: LLMClient, tools: ToolRegistry, summaries: dict,
+                 file_graph: dict[str, set[str]] | None = None):
         self.llm = llm
         self.tools = tools
         self.summaries = summaries
+        self.file_graph = file_graph if file_graph is not None else build_file_graph(summaries)
 
-    def analyze(self, units: list[Unit]) -> dict[str, set[str]]:
-        """分析 unit 依赖关系 — 静态第一遍，LLM 第二遍"""
-        # 构建名称索引
+    def analyze(self, units: list[Unit], use_llm: bool = True) -> dict[str, set[str]]:
+        """分析 unit 依赖关系 — 静态第一遍，LLM 第二遍（可关闭）"""
         name_to_unit = {u.name: u for u in units}
-        file_to_unit = {}
+        file_to_unit: dict[str, str] = {}
         for u in units:
             for src in u.sources:
-                file_to_unit[src] = u.name
+                file_to_unit[norm_path(src)] = u.name
 
-        # ---- 静态第一遍：基于 project_imports 匹配 ----
+        # ---- 静态第一遍：文件级依赖图投影到 unit 级 ----
         static_deps: dict[str, set[str]] = {u.name: set() for u in units}
+        for file_path, dep_files in self.file_graph.items():
+            src_unit = file_to_unit.get(norm_path(file_path))
+            if not src_unit:
+                continue
+            for dep_file in dep_files:
+                dep_unit = file_to_unit.get(norm_path(dep_file))
+                if dep_unit and dep_unit != src_unit:
+                    static_deps[src_unit].add(dep_unit)
 
-        for u in units:
-            for src in u.sources:
-                s = self.summaries.get(src)
-                if not isinstance(s, FileSummary):
-                    continue
-
-                # 检查每个 project_import 属于哪个 unit
-                for imp in s.project_imports:
-                    dep_unit = self._match_file_to_unit(imp, file_to_unit)
-                    if dep_unit and dep_unit != u.name:
-                        static_deps[u.name].add(dep_unit)
-
-        print(f"  静态匹配结果:")
+        print(f"  静态依赖结果:")
         for name in sorted(static_deps.keys()):
             deps = static_deps[name]
-            if deps:
-                print(f"    {name}: 依赖 {deps}")
-            else:
-                print(f"    {name}: 无（同包引用，需 LLM 补充）")
+            print(f"    {name}: 依赖 {sorted(deps) if deps else '无'}")
 
-        # ---- LLM 第二遍：补充隐式依赖 ----
+        if not use_llm:
+            return static_deps
+
+        # ---- LLM 第二遍：审核并补充隐式依赖 ----
         unit_descriptions = []
         for u in units:
             sources_desc = []
             for src in u.sources:
-                s = self.summaries.get(src)
+                s = self.summaries.get(src) or self.summaries.get(norm_path(src))
                 if isinstance(s, FileSummary):
                     sources_desc.append(
                         f"  [{Path(src).name}] {s.class_name} ({s.class_type}) — "
@@ -655,17 +766,23 @@ class UnitDependencyAnalyzer:
                 f"## {u.name}\n" + "\n".join(sources_desc)
             )
 
+        static_deps_json = json.dumps(
+            {k: sorted(v) for k, v in static_deps.items()}, ensure_ascii=False, indent=2
+        )
+
         prompt = f"""## 单元详情
 {chr(10).join(unit_descriptions)}
 
 ## 单元列表
 {json.dumps([u.name for u in units], ensure_ascii=False)}
 
+## 静态分析已得到的依赖（键依赖值列表，请保留并在此基础上补充）
+{static_deps_json}
+
 ## 分析重点
-1. 所有 Java 文件在同一个 package 下，无需 import 即可引用彼此
-2. Activity 之间通过 Intent 跳转（如 MainActivity → HomeActivity）
-3. DbHelper 数据库工具类被哪些 Activity 实例化使用
-4. 不需要 LLM 调用任何工具，根据摘要直接分析即可
+1. 静态依赖已覆盖 import、同包类型引用、Intent 跳转、布局引用，无需重复检查
+2. 重点找隐式协议依赖：共享的持久化数据、广播、全局状态
+3. 根据摘要直接分析即可，仅在摘要不足时调用工具
 
 请输出依赖关系 JSON。"""
 
@@ -685,95 +802,63 @@ class UnitDependencyAnalyzer:
             data = SummaryGenerator._parse_json(final)
             if data and "dependencies" in data:
                 llm_deps = data["dependencies"]
+                added = []
                 for unit_name, dep_list in llm_deps.items():
                     if unit_name in static_deps:
                         for dep in dep_list:
-                            if dep in name_to_unit:
+                            if dep in name_to_unit and dep != unit_name \
+                                    and dep not in static_deps[unit_name]:
                                 static_deps[unit_name].add(dep)
+                                added.append(f"{unit_name} → {dep}")
+                if added:
+                    print(f"  LLM 补充依赖: {added}")
 
                 reasoning = data.get("reasoning", "")
                 if reasoning:
                     print(f"  LLM 分析: {reasoning}")
             else:
-                print(f"  ⚠️ LLM 输出 JSON 解析失败")
+                print(f"  ⚠️ LLM 输出 JSON 解析失败，保留静态依赖结果")
         except Exception as e:
-            print(f"  ⚠️ LLM 依赖分析失败: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"  ⚠️ LLM 依赖分析失败: {e}，保留静态依赖结果")
 
         return static_deps
-
-    def _import_to_path(self, imp: str) -> str | None:
-        """将 Java import 转为可能的文件路径尾部"""
-        # com.example.crudapp.DbHelper → DbHelper.java
-        parts = imp.split('.')
-        if len(parts) >= 2:
-            class_name = parts[-1]
-            return f"{class_name}.java"
-        return None
-
-    def _match_file_to_unit(self, import_class_name: str, file_to_unit: dict[str, str]) -> str | None:
-        """根据 import 的类名在 file_to_unit 中查找匹配的 unit"""
-        # com.example.crudapp.DbHelper → DbHelper.java
-        parts = import_class_name.split('.')
-        target_file = f"{parts[-1]}.java"
-
-        # 在 file_to_unit 的 keys 中搜索匹配
-        for file_path, unit_name in file_to_unit.items():
-            if file_path.endswith(target_file) or file_path.endswith('/' + target_file):
-                return unit_name
-        return None
 
 
 # ============================================================
 # 步骤 5: 拓扑排序
 # ============================================================
 
-def topological_sort(units: list[Unit], deps: dict[str, set[str]]) -> list[list[Unit]]:
-    """将 unit 依赖图拓扑排序，返回分层列表（同层可并行翻译）"""
+def topological_sort(
+    units: list[Unit], deps: dict[str, set[str]]
+) -> tuple[list[list[Unit]], list[list[str]]]:
+    """将 unit 依赖图拓扑排序（Tarjan SCC 缩点 + 最长路径分层）。
+
+    返回 (layers, cycles)：
+    - layers: 分层列表，任意 unit 的所有依赖都在更早的层；同层可并行翻译
+    - cycles: 循环依赖分组（同一 SCC 的 unit 名列表），环内成员被放在同一层，
+      翻译时应把环内所有成员的摘要一起放进上下文
+    """
     name_to_unit = {u.name: u for u in units}
+    names = [u.name for u in units]
 
-    # 构建邻接表：dep_A → 依赖它的那些 unit
-    # 边方向：A 依赖 B → 翻译顺序 B 在 A 之前 → 边 B→A
-    adj = defaultdict(set)
-    in_degree = defaultdict(int)
+    name_layers, cycles = layered_topological_sort(names, deps)
 
-    for u in units:
-        in_degree[u.name] = in_degree.get(u.name, 0)
-        for dep_name in deps.get(u.name, set()):
-            if dep_name in name_to_unit:
-                adj[dep_name].add(u.name)
-                in_degree[u.name] += 1
+    if cycles:
+        for cycle in cycles:
+            print(f"  ⚠️ 检测到循环依赖，成员将放入同一层: {cycle}")
 
-    # BFS 分层
-    queue = deque()
-    for u in units:
-        if in_degree[u.name] == 0:
-            queue.append((u.name, 0))
+    layers: list[list[Unit]] = []
+    for layer_names in name_layers:
+        layer = [name_to_unit[n] for n in layer_names if n in name_to_unit]
+        # 层内排序：被依赖多的排前面，串行执行时先翻译更基础的 unit
+        dependents_count = {
+            n: sum(1 for dep_set in deps.values() if n in dep_set) for n in layer_names
+        }
+        layer.sort(key=lambda u: (-dependents_count.get(u.name, 0), u.name))
+        if layer:
+            layers.append(layer)
 
-    depth_map: dict[str, int] = {}
-    while queue:
-        name, depth = queue.popleft()
-        if name in depth_map:
-            continue
-        depth_map[name] = depth
-        for neighbor in adj[name]:
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append((neighbor, depth + 1))
-
-    # 处理未到达的（循环依赖）
-    for u in units:
-        if u.name not in depth_map:
-            depth_map[u.name] = max(depth_map.values()) + 1 if depth_map else 0
-
-    # 按深度分组
-    max_depth = max(depth_map.values()) if depth_map else 0
-    layers: list[list[Unit]] = [[] for _ in range(max_depth + 1)]
-    for u in units:
-        layers[depth_map[u.name]].append(u)
-
-    return layers
+    return layers, cycles
 
 
 # ============================================================
@@ -810,25 +895,36 @@ class OrderDeterminer:
             str(self.project_path), files, cache_path=cache_path
         )
 
-        # 3. 划分 Unit
-        print(f"\n[3/5] LLM 划分翻译单元...")
+        # 3. 静态依赖层：文件级依赖图 + Java↔XML 硬绑定分组
+        print(f"\n[3/6] 构建静态依赖图与硬绑定分组...")
+        file_graph = build_file_graph(self.summaries)
+        hard_groups = build_hard_groups(self.summaries)
+        edge_count = sum(len(v) for v in file_graph.values())
+        print(f"  文件级依赖边: {edge_count} 条, 硬绑定组: {len(hard_groups)} 个")
+        for g in hard_groups:
+            print(f"    组: {[Path(f).name for f in g]}")
+
+        # 4. 划分 Unit（受硬绑定约束）
+        print(f"\n[4/6] LLM 划分翻译单元...")
         tools = ToolRegistry(str(self.project_path), self.summaries)
         unit_builder = UnitBuilder(self.llm, tools)
-        units = unit_builder.build_units(java_files, xml_files)
+        units = unit_builder.build_units(java_files, xml_files, hard_groups)
 
         print(f"  划分结果: {len(units)} 个单元")
         for u in units:
             names = [Path(s).name for s in u.sources]
             print(f"    [{u.name}] → {names}")
 
-        # 4. 分析 Unit 依赖
-        print(f"\n[4/5] 分析 Unit 依赖...")
-        dep_analyzer = UnitDependencyAnalyzer(self.llm, tools, self.summaries)
+        # 5. 分析 Unit 依赖（静态投影 + LLM 补充）
+        print(f"\n[5/6] 分析 Unit 依赖...")
+        dep_analyzer = UnitDependencyAnalyzer(
+            self.llm, tools, self.summaries, file_graph=file_graph
+        )
         unit_deps = dep_analyzer.analyze(units)
 
-        # 5. 拓扑排序
-        print(f"\n[5/5] 拓扑排序...")
-        layers = topological_sort(units, unit_deps)
+        # 6. 拓扑排序（SCC 缩点）
+        print(f"\n[6/6] 拓扑排序...")
+        layers, cycles = topological_sort(units, unit_deps)
 
         print(f"\n翻译顺序（分 {len(layers)} 层）:")
         for depth, layer in enumerate(layers):
@@ -837,6 +933,21 @@ class OrderDeterminer:
                 f"→ {d}" for u in layer for d in sorted(unit_deps.get(u.name, set()))
             )[:100]
             print(f"  第{depth}层: {names}  {deps_info}")
+
+        # 校验不变量并导出产物
+        all_files = java_files + xml_files
+        violations = validate_plan(units, unit_deps, layers, all_files, hard_groups)
+        if violations:
+            print(f"\n⚠️ 校验发现 {len(violations)} 个问题:")
+            for v in violations:
+                print(f"  - {v}")
+        else:
+            print(f"\n✓ 校验通过：文件覆盖 / 依赖边 / 拓扑序 / 硬绑定均满足")
+
+        export_artifacts(
+            self.cache_dir, units, file_graph, hard_groups,
+            unit_deps, layers, cycles, violations,
+        )
 
         return layers, unit_deps
 

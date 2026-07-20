@@ -19,6 +19,8 @@ def _summary_to_dict(s) -> dict:
             "implements": s.implements,
             "class_line": s.class_line,
             "project_imports": s.project_imports,
+            "type_references": s.type_references,
+            "intent_targets": s.intent_targets,
             "import_region": f"L{s.import_start}-L{s.import_end}",
             "android_imports_count": s.android_imports_count,
             "resource_refs": s.resource_refs,

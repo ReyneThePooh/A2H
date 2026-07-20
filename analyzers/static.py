@@ -63,6 +63,10 @@ class FileSummary:
     import_end: int = 0
     android_imports_count: int = 0
 
+    # 静态依赖线索（无需 import 也能提取）
+    type_references: list[str] = field(default_factory=list)  # 代码中引用的类型简单名（字段/参数/返回值/new/extends/静态调用）
+    intent_targets: list[str] = field(default_factory=list)   # new Intent(..., Xxx.class) 的跳转目标类名
+
     # 资源引用
     resource_refs: dict[str, list[str]] = field(default_factory=dict)
 
@@ -126,9 +130,11 @@ class JavaStaticAnalyzer:
             cls._extract_class_info(tree, lines_list, s)
             cls._extract_methods(tree, lines_list, s)
             cls._extract_fields(tree, lines_list, s)
+            cls._extract_type_references(tree, s)
 
         # 正则提取（不依赖 AST）
         cls._extract_resources(code, s)
+        cls._extract_intent_targets(code, s)
         cls._detect_features(code, s)
 
         return s
@@ -273,6 +279,50 @@ class JavaStaticAnalyzer:
         if 'private' in modifiers:
             return 'private'
         return 'package'
+
+    @classmethod
+    def _extract_type_references(cls, tree, s: FileSummary):
+        """提取代码中引用的类型简单名（同包引用无 import，靠这里补齐）"""
+        refs: set[str] = set()
+
+        # 字段/参数/返回值/局部变量/泛型/new Xxx() 中出现的引用类型
+        for _, node in tree.filter(javalang.tree.ReferenceType):
+            if node.name:
+                refs.add(node.name)
+
+        # 静态成员访问与静态方法调用的限定名（如 DbHelper.TABLE_NAME / Utils.format()）
+        # 限定名首字母大写才可能是类名，小写多为变量名
+        for node_type in (javalang.tree.MemberReference, javalang.tree.MethodInvocation):
+            for _, node in tree.filter(node_type):
+                q = node.qualifier
+                if q and '.' not in q and q[:1].isupper():
+                    refs.add(q)
+
+        # Xxx.class 引用（Intent、反射等）
+        for _, node in tree.filter(javalang.tree.ClassReference):
+            if node.type and node.type.name:
+                refs.add(node.type.name)
+
+        if s.extends:
+            refs.add(s.extends)
+        refs.update(s.implements)
+        refs.discard(s.class_name)
+
+        s.type_references = sorted(refs)
+
+    # new Intent(context, XxxActivity.class) / intent.setClass(ctx, Xxx.class)
+    INTENT_PATTERNS = [
+        r'new\s+Intent\s*\([^;)]*?(\w+)\s*\.\s*class',
+        r'\.setClass(?:Name)?\s*\([^;)]*?(\w+)\s*\.\s*class',
+    ]
+
+    @classmethod
+    def _extract_intent_targets(cls, code: str, s: FileSummary):
+        targets: set[str] = set()
+        for pattern in cls.INTENT_PATTERNS:
+            targets.update(re.findall(pattern, code))
+        targets.discard(s.class_name)
+        s.intent_targets = sorted(targets)
 
     @classmethod
     def _extract_resources(cls, code: str, s: FileSummary):
