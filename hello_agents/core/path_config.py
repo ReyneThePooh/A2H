@@ -32,4 +32,3 @@ ANDROID_PROJECT_DIR = env_path(
 HARMONY_TEMPLATE_DIR = env_path("HARMONY_TEMPLATE_DIR", "HarmonyTemplate")
 HARMONY_SOURCE_PROJECT_DIR = env_path("HARMONY_SOURCE_PROJECT_DIR", "HarmonyProject")
 HARMONY_WORK_BASE_DIR = env_path("HARMONY_WORK_BASE_DIR", "HarmonyCheckWorkDir")
-KNOWLEDGE_DIR = env_path("KNOWLEDGE_DIR", "knowledge")

@@ -179,3 +179,9 @@ HarmonyCheckWorkDir_*/
 # Packaged/generated outputs
 outputs/
 artifacts/
+
+# 翻译流水线生成的 Harmony 工程产物（HARMONY_SOURCE_PROJECT_DIR 默认值）
+/HarmonyProject/
+
+# PPT 排版任务的本地工作缓存
+.pptx-layout-work/

@@ -196,6 +196,11 @@ SIMPLE_EXECUTOR_PROMPT = """你是一个 Java/XML → ArkTS 代码翻译专家�
 ## 翻译规则
 - 资源引用: R.string.xxx → $r('app.string.xxx'), R.color.xxx → $r('app.color.xxx')
 - 组件: TextView→Text, EditText→TextInput, Button→Button, LinearLayout→Column/Row, ListView→List+ForEach
+- 布局尺寸（必须遵守）:
+  - 组件带 style="@style/xxx" 时，宽高/权重/字号/颜色以源码后附带的 style 定义为准，不得凭空猜测
+  - android:layout_weight / layout_columnWeight → .layoutWeight(n)；layout_width="0dp" 配合 weight 表示按权重分配，不是固定宽度
+  - Row 的直接子组件要均分宽度时用 .layoutWeight(1)，严禁设置 .width('100%')（会把整行挤爆）
+  - GridLayout → 逐行 Row + 子组件 .layoutWeight(1)（或 Grid + columnsTemplate）；rowSpan/columnSpan 用嵌套 Row/Column + layoutWeight 还原
 - 生命周期: onCreate→aboutToAppear, onDestroy→aboutToDisappear
 - SQLite → relationalStore (@ohos.data.relationalStore)
 - 若 Planner 给的行范围不足，可用 read_file_region 补充读取
@@ -225,6 +230,11 @@ STEP_EXECUTOR_PROMPT = """你是一个 Java/XML → ArkTS 代码翻译专家。�
 - 在当前累积代码基础上增量添加本步骤结果
 - 第一步请从 import 开始完整输出结构声明
 - 资源引用: R.string.xxx → $r('app.string.xxx')
+- 布局尺寸（必须遵守）:
+  - 组件带 style="@style/xxx" 时，宽高/权重/字号/颜色以源码后附带的 style 定义为准，不得凭空猜测
+  - android:layout_weight / layout_columnWeight → .layoutWeight(n)；layout_width="0dp" 配合 weight 表示按权重分配，不是固定宽度
+  - Row 的直接子组件要均分宽度时用 .layoutWeight(1)，严禁设置 .width('100%')（会把整行挤爆）
+  - GridLayout → 逐行 Row + 子组件 .layoutWeight(1)（或 Grid + columnsTemplate）；rowSpan/columnSpan 用嵌套 Row/Column + layoutWeight 还原
 - 若代码不够，可用 read_file_region 补充
 
 ## 输出格式（严格 JSON）
@@ -246,16 +256,30 @@ class SourceReader:
 
     def __init__(self, project_root: Path):
         self.root = project_root
+        self._styles: dict[str, tuple[str, str]] | None = None  # name -> (parent, xml_text)
 
     def read_regions(self, regions: list[dict]) -> str:
-        """读取指定区域，组装为标注文本"""
+        """读取指定区域，组装为标注文本。
+
+        XML（布局/资源）文件一律全量注入：布局文件本身很短，
+        只给片段会让 LLM 看不到完整结构，翻出破碎的 UI。
+        """
         parts = []
+        xml_seen: set[Path] = set()
         for r in regions:
             filename = r.get("file", "")
             lines_spec = r.get("lines", "")
             fpath = self._find(filename)
             if not fpath:
                 parts.append(f"// [未找到文件: {filename}]")
+                continue
+
+            if fpath.suffix == ".xml":
+                if fpath in xml_seen:
+                    continue
+                xml_seen.add(fpath)
+                content = fpath.read_text(encoding='utf-8')
+                parts.append(f"<!-- ===== {filename} (完整文件) ===== -->\n{content}\n")
                 continue
 
             start, end = self._parse_lines(lines_spec, fpath)
@@ -269,7 +293,8 @@ class SourceReader:
             for i in range(start, end):
                 parts.append(all_lines[i])
 
-        return "".join(parts)
+        text = "".join(parts)
+        return text + self._style_context(text)
 
     def read_all(self, sources: list[str]) -> str:
         """读取所有源文件的完整内容"""
@@ -285,7 +310,65 @@ class SourceReader:
             prefix = "//" if ext == ".java" else "<!--"
             suffix = "" if ext == ".java" else " -->"
             parts.append(f"{prefix} ===== {Path(src).name} ===== {suffix}\n{code}")
-        return "\n\n".join(parts)
+        text = "\n\n".join(parts)
+        return text + self._style_context(text)
+
+    # ---- style 上下文 ----
+
+    def _style_context(self, content: str) -> str:
+        """提取 content 中引用的 @style/Xxx，附上 res/values 里的 style 定义。
+
+        Android 布局常把宽高/字号/颜色放在 style 里（如 layout_width=0dp +
+        layout_columnWeight=1），不注入这些定义 LLM 只能瞎猜组件尺寸。
+        """
+        import re
+        names = set(re.findall(r'@style/([\w.]+)', content))
+        if not names:
+            return ""
+        styles = self._load_styles()
+        blocks: list[str] = []
+        emitted: set[str] = set()
+
+        def emit(name: str):
+            if name in emitted or name not in styles:
+                return
+            emitted.add(name)
+            parent, xml_text = styles[name]
+            blocks.append(xml_text)
+            # 显式 parent 或者点号命名的隐式 parent（AppTheme.NoActionBar → AppTheme）
+            if parent:
+                emit(parent.split('/')[-1])
+            elif '.' in name:
+                emit(name.rsplit('.', 1)[0])
+
+        for n in sorted(names):
+            emit(n)
+        if not blocks:
+            return ""
+        header = ("\n\n<!-- ===== 布局引用的 style 定义（来自 res/values，"
+                  "组件的宽高/权重/字号/颜色以此为准）===== -->\n")
+        return header + "\n".join(blocks)
+
+    def _load_styles(self) -> dict[str, tuple[str, str]]:
+        """扫描 res/values*/ 下所有 <style>，建立 name -> (parent, 原文) 索引"""
+        if self._styles is not None:
+            return self._styles
+        from xml.etree import ElementTree as ET
+        self._styles = {}
+        for f in self.root.rglob("*.xml"):
+            if not f.parent.name.startswith("values") or "build" in f.parts:
+                continue
+            try:
+                root = ET.parse(f).getroot()
+            except ET.ParseError:
+                continue
+            for style in root.findall("style"):
+                name = style.attrib.get("name", "")
+                if not name:
+                    continue
+                parent = style.attrib.get("parent", "")
+                self._styles[name] = (parent, ET.tostring(style, encoding='unicode').strip())
+        return self._styles
 
     def _find(self, filename: str) -> Path | None:
         name = Path(filename).name
@@ -497,8 +580,10 @@ class UnitTranslator:
                     data = _parse_json(result)
                 if data:
                     accumulated = data.get("code", accumulated)
-                    if data.get("done"):
-                        break
+                    # done 只在最后一步生效：LLM 提前宣布完成会把剩余步骤
+                    # （如事件处理/业务逻辑）整个跳过，产出只有 UI 没有功能的页面
+                    if data.get("done") and i < total - 1:
+                        print(f"      ⚠️ LLM 在第 {i + 1}/{total} 步提前返回 done，忽略并继续执行剩余步骤")
                 else:
                     preview = (result or "空")[:200]
                     print(f"      ⚠️ 解析失败: [{preview}]")

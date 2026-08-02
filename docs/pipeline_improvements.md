@@ -88,8 +88,23 @@ python -m pytest tests/test_static_graph.py -v
 - `topological_sort` 的返回值从 `layers` 变为 `(layers, cycles)`，仓库内唯一调用方（`OrderDeterminer.run`）已同步更新；如有外部调用需注意。
 - 翻译阶段可进一步利用两个新产物：`cycles`（环内成员应共享翻译上下文）和 `.pipeline_cache/translation_plan.json`（可回放、可人工审查的完整计划）。
 
+## 补充：完整工程打包（2026-07-21 新增）
+
+翻译产物现在可以直接套进 DevEco 壳工程模板，产出可构建、可运行的完整鸿蒙工程：
+
+- **`pipeline/project_packager.py`**：复制 `HarmonyTemplate/template` 模板（跳过 build/.hvigor 等缓存）→ 合并翻译产物的 ets/resources（`pages/` 整目录替换，element JSON **键级合并**，保留模板 `module_desc` 等被 `module.json5` 引用的 key）→ 仅把含 `@Entry` 的页面注册进 `main_pages.json` 并同步 `EntryAbility.loadContent` 入口页 → 把 AndroidManifest 的 `uses-permission` 映射为 ohos 权限注入 `module.json5` → 为主流程提供 `hvigorw assembleHap` 构建能力（需 `.env` 的 `NODE_HOME`）。
+- **`main.py`**：统一入口，一条命令跑完顺序确定 → 资源迁移 → Unit 翻译 → 打包 → 构建与反思修复：
+
+```powershell
+conda activate A2H
+python main.py
+```
+
+- `ResourceMigrator` 不再生成简化版 `module.json5` / `build-profile.json5`（模板的完整配置在打包时保留）。
+- 已用 `test1\Calculator` 验证：翻译 + 打包 + `hvigorw assembleHap` 构建成功。要在模拟器运行，用 DevEco Studio 打开输出工程，配置自动签名（File → Project Structure → Signing Configs）后点 Run；`.hap` 在签名配置后才会产出。
+
 ## 后续可做（本次未包含）
 
 - 把 `values` 资源（string/color/dimen）依赖接入文件图，与 `resource_migrator` 的映射打通；
 - Unit 粒度的自动评估指标（内聚度 = 组内边 / 跨组边），对 LLM 划分结果打分并自动重试；
-- 旧流水线（`main.py` + `TopologyGraghExtractor.py`）标记废弃，把交互/支持类分流思路迁入新流水线。
+- 根据真实项目继续补充 ArkTS 构建错误知识与回归用例。

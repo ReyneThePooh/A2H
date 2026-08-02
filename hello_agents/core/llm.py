@@ -330,8 +330,25 @@ class HelloAgentsLLM:
                 max_tokens=kwargs.get('max_tokens', self.max_tokens),
                 **{k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens']}
             )
-            return response.choices[0].message.content
+            if not response.choices:
+                raise HelloAgentsException("LLM响应不包含任何候选结果。")
+
+            choice = response.choices[0]
+            message = choice.message
+            content = message.content
+            if content is None:
+                # 某些 OpenAI 兼容服务会返回空 content（例如只返回工具调用）。
+                # 调用方可将空字符串按“无结果”处理，避免在 .strip() 时崩溃。
+                print(
+                    "[WARN] LLM returned no text content: "
+                    f"finish_reason={getattr(choice, 'finish_reason', None)}, "
+                    f"tool_calls={bool(getattr(message, 'tool_calls', None))}"
+                )
+                return ""
+            return content
         except Exception as e:
+            if isinstance(e, HelloAgentsException):
+                raise
             raise HelloAgentsException(f"LLM调用失败: {str(e)}")
 
     def stream_invoke(self, messages: list[dict[str, str]], **kwargs) -> Iterator[str]:
