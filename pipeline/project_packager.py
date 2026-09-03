@@ -20,6 +20,33 @@ from pathlib import Path
 # 模板中不需要复制的缓存/产物目录
 TEMPLATE_IGNORES = {"build", ".hvigor", ".idea", "oh_modules", ".preview"}
 
+
+class ResourceValidationError(ValueError):
+    """打包后的 HarmonyOS 资源未通过确定性校验。"""
+
+
+class ResourceConflictError(ResourceValidationError):
+    """打包后的 HarmonyOS 资源存在逻辑名称冲突。"""
+
+    def __init__(self, conflicts: list[dict[str, object]]):
+        self.conflicts = conflicts
+        details = []
+        for conflict in conflicts:
+            files = ", ".join(str(path) for path in conflict["files"])
+            details.append(
+                f"{conflict['directory']}/{conflict['name']}: {files}"
+            )
+        super().__init__("资源逻辑名称冲突：" + "; ".join(details))
+
+
+class InvalidResourceNameError(ResourceValidationError):
+    """资源文件名含 HarmonyOS 不支持的字符。"""
+
+    def __init__(self, invalid_names: list[dict[str, object]]):
+        self.invalid_names = invalid_names
+        details = ", ".join(str(item["file"]) for item in invalid_names)
+        super().__init__(f"资源文件名只能包含字母、数字和下划线：{details}")
+
 # Android 权限 → HarmonyOS 权限（常见项；无对应或需特殊申请的跳过并告警）
 PERMISSION_MAP = {
     "android.permission.INTERNET": "ohos.permission.INTERNET",
@@ -152,6 +179,55 @@ def _merge_generated_resources(src_res: Path, target_res: Path):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_file, target)
     print("  resources/ 已合并（element JSON 键级合并）")
+
+
+def find_resource_name_conflicts(resources_root: str | Path) -> list[dict[str, object]]:
+    """查找同一资源目录中同名但扩展名不同的文件。"""
+    root = Path(resources_root)
+    if not root.exists():
+        return []
+
+    grouped: dict[tuple[str, str], list[Path]] = {}
+    for resource in root.rglob("*"):
+        if not resource.is_file():
+            continue
+        relative = resource.relative_to(root)
+        key = (relative.parent.as_posix().casefold(), resource.stem.casefold())
+        grouped.setdefault(key, []).append(relative)
+
+    conflicts = []
+    for (directory, name), files in sorted(grouped.items()):
+        if len(files) > 1:
+            conflicts.append({
+                "directory": directory,
+                "name": name,
+                "files": sorted(files, key=lambda path: path.as_posix().casefold()),
+            })
+    return conflicts
+
+
+def find_invalid_resource_names(resources_root: str | Path) -> list[dict[str, object]]:
+    """查找不符合 HarmonyOS ``[a-zA-Z0-9_]`` 规则的逻辑资源名。"""
+    root = Path(resources_root)
+    if not root.exists():
+        return []
+    invalid = []
+    for resource in root.rglob("*"):
+        if resource.is_file() and not re.fullmatch(r"[a-zA-Z0-9_]+", resource.stem):
+            invalid.append({
+                "name": resource.stem,
+                "file": resource.relative_to(root),
+            })
+    return sorted(invalid, key=lambda item: str(item["file"]).casefold())
+
+
+def validate_resource_names(resources_root: str | Path) -> None:
+    conflicts = find_resource_name_conflicts(resources_root)
+    if conflicts:
+        raise ResourceConflictError(conflicts)
+    invalid_names = find_invalid_resource_names(resources_root)
+    if invalid_names:
+        raise InvalidResourceNameError(invalid_names)
 
 
 def _normalize_app_label(target_res: Path):
@@ -436,6 +512,7 @@ def package_project(
         android_permissions or [],
         target_main / "resources" / "base" / "element" / "string.json",
     )
+    validate_resource_names(target_main / "resources")
 
     print(f"  打包完成: {output_dir}")
     return output_dir

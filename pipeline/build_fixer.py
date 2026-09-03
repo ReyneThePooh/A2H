@@ -11,8 +11,14 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from pipeline.project_packager import run_hvigor
-from pipeline.unit_translator import LLMClient
+from hello_agents.core.llm import HelloAgentsLLM
+
+from pipeline.project_packager import (
+    find_invalid_resource_names,
+    find_resource_name_conflicts,
+    run_hvigor,
+)
+from pipeline.agents import create_pipeline_llm
 
 
 # ============================================================
@@ -43,6 +49,37 @@ class ErrorParser:
                 "column": 1,
                 "message": f"Could not resolve {missing}",
                 "code": "HVIGOR_RESOLVE",
+            })
+
+        # HarmonyOS 资源名不含扩展名；foo.png 与 foo.webp 会发生冲突。
+        r_resource_conflict = re.compile(
+            r"Error Message:\s*Resource\s+'([^']+)'\s+conflict\.\s*"
+            r"It is first declared at\s+'([^']+)'\s+and declared again at\s+'([^']+)'",
+            re.IGNORECASE,
+        )
+        for m in r_resource_conflict.finditer(text):
+            name, first_file, second_file = m.groups()
+            errors.append({
+                "file": second_file.strip(),
+                "line": 1,
+                "column": 1,
+                "message": f"Resource '{name}' conflicts with '{first_file.strip()}'",
+                "code": "RESOURCE_CONFLICT",
+            })
+
+        r_invalid_resource = re.compile(
+            r"Error Message:\s*Invalid resource name\s+'([^']+)'\."
+            r"[^\r\n]*At file:\s*([^\r\n]+)",
+            re.IGNORECASE,
+        )
+        for m in r_invalid_resource.finditer(text):
+            name, file_path = m.groups()
+            errors.append({
+                "file": file_path.strip(),
+                "line": 1,
+                "column": 1,
+                "message": f"Invalid resource name '{name}'",
+                "code": "RESOURCE_INVALID_NAME",
             })
 
         # ArkTS 错误跨行输出：ERROR: 10505001 ArkTS Compiler Error
@@ -119,6 +156,8 @@ ERROR_KNOWLEDGE = {
     "TS2339": "属性不存在，可能是Android API未转换为ArkTS语法",
     "TS2345": "参数类型错误",
     "HVIGOR_RESOLVE": "模块导入路径无法解析，检查import路径与实际文件位置",
+    "RESOURCE_CONFLICT": "同一资源目录只能保留一个逻辑名称相同的文件",
+    "RESOURCE_INVALID_NAME": "资源名只能包含字母、数字和下划线",
 }
 
 INITIAL_PROMPT = """以下ArkTS文件编译失败，请修复所有错误。
@@ -175,9 +214,9 @@ REFINE_PROMPT = """请根据审查意见改进代码。
 class BuildFixLoop:
     """构建-修复-再验证闭环"""
 
-    def __init__(self, llm: Optional[LLMClient] = None,
+    def __init__(self, llm: Optional[HelloAgentsLLM] = None,
                  max_fix_rounds: int = 3, reflect_rounds: int = 2):
-        self.llm = llm or LLMClient()
+        self.llm = llm or create_pipeline_llm()
         self.max_fix_rounds = max_fix_rounds
         self.reflect_rounds = reflect_rounds
 
@@ -199,6 +238,39 @@ class BuildFixLoop:
         errors: list[dict] = []
         builds = 0
 
+        resource_conflicts = find_resource_name_conflicts(
+            project_dir / "entry" / "src" / "main" / "resources"
+        )
+        invalid_resource_names = find_invalid_resource_names(
+            project_dir / "entry" / "src" / "main" / "resources"
+        )
+        if resource_conflicts or invalid_resource_names:
+            errors = []
+            for conflict in resource_conflicts:
+                files = list(conflict["files"])
+                errors.append({
+                    "file": str(files[-1]),
+                    "line": 1,
+                    "column": 1,
+                    "message": (
+                        f"Resource '{conflict['name']}' conflict: "
+                        + ", ".join(str(path) for path in files)
+                    ),
+                    "code": "RESOURCE_CONFLICT",
+                })
+            for invalid in invalid_resource_names:
+                errors.append({
+                    "file": str(invalid["file"]),
+                    "line": 1,
+                    "column": 1,
+                    "message": f"Invalid resource name '{invalid['name']}'",
+                    "code": "RESOURCE_INVALID_NAME",
+                })
+            print(f"\n❌ 构建前检查发现 {len(errors)} 个资源问题")
+            for error in errors:
+                print(f"  - {error['message']}")
+            return self._result(False, 0, len(errors), errors)
+
         # 共 max_fix_rounds 轮修复，每轮前后都有构建：最后一次构建仅做验证
         for round_no in range(self.max_fix_rounds + 1):
             result = run_hvigor(project_dir)
@@ -215,12 +287,16 @@ class BuildFixLoop:
 
             if not errors:
                 print("\n⚠️ 构建失败但未解析到任何错误，无法自动修复（打印日志尾部）")
-                print("\n".join((result.stdout or "").splitlines()[-30:]))
+                self._print_log_tail(result)
                 break
 
             print(f"\n❌ 第 {builds} 次构建发现 {len(errors)} 个错误")
             if round_no == self.max_fix_rounds:
                 print(f"⚠️ 已达到最大修复轮数 ({self.max_fix_rounds})，停止修复")
+                break
+
+            if any(str(error.get("code", "")).startswith("RESOURCE_") for error in errors):
+                print("⚠️ 资源问题需要确定性处理，跳过 LLM 代码修复")
                 break
 
             print(f"\n🤖 第 {round_no + 1}/{self.max_fix_rounds} 轮反思修复...")
@@ -321,6 +397,17 @@ class BuildFixLoop:
         return None
 
     # ---- 辅助 ----
+
+    @staticmethod
+    def _print_log_tail(result, lines: int = 30):
+        stdout_tail = "\n".join((result.stdout or "").splitlines()[-lines:])
+        stderr_tail = "\n".join((result.stderr or "").splitlines()[-lines:])
+        if stdout_tail:
+            print("=== stdout ===")
+            print(stdout_tail)
+        if stderr_tail:
+            print("=== stderr ===")
+            print(stderr_tail)
 
     def _invoke(self, prompt: str) -> str:
         messages = [

@@ -88,7 +88,7 @@ class ToolRegistry:
         self.resource_mapping: dict | None = None
         if resource_mapping_path and Path(resource_mapping_path).exists():
             import json
-            with open(resource_mapping_path, 'r') as f:
+            with open(resource_mapping_path, 'r', encoding='utf-8') as f:
                 self.resource_mapping = json.load(f)
 
     def get_tool_schemas(self) -> list[dict]:

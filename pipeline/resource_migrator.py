@@ -1,12 +1,68 @@
 """静态资源迁移 — Android res/ → HarmonyOS resources/（工程配置由 project_packager 套模板提供）"""
 
-import os
 import json
 import shutil
 import re
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from xml.etree import ElementTree as ET
+
+
+MEDIA_SUFFIXES = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'}
+DENSITY_PRIORITY = {
+    'ldpi': 1,
+    'mdpi': 2,
+    'hdpi': 3,
+    'xhdpi': 4,
+    'xxhdpi': 5,
+    'xxxhdpi': 6,
+    'nodpi': 7,
+    'anydpi': 7,
+}
+
+
+def reset_generated_artifacts(harmony_root: str | Path) -> list[Path]:
+    """清理完整翻译拥有的产物，避免不同 Android 项目之间交叉污染。
+
+    只删除生成页面、生成资源和资源映射；模板、流水线缓存及其他文件不受影响。
+    ``--resume`` 流程不会调用此函数。
+    """
+    root = Path(harmony_root)
+    targets = (
+        root / "entry" / "src" / "main" / "ets" / "pages",
+        root / "entry" / "src" / "main" / "resources",
+        root / ".resource_mapping.json",
+    )
+    removed: list[Path] = []
+    for target in targets:
+        if target.is_dir():
+            shutil.rmtree(target)
+            removed.append(target)
+        elif target.exists():
+            target.unlink()
+            removed.append(target)
+
+    if removed:
+        print(f"  已清理上一轮生成产物 ({len(removed)} 项)")
+    return removed
+
+
+def _media_priority(path: Path) -> tuple[int, int, str]:
+    """优先保留高密度资源；同密度时以文件大小和路径稳定决胜。"""
+    qualifiers = path.parent.name.lower().split("-")[1:]
+    density = max((DENSITY_PRIORITY.get(q, 0) for q in qualifiers), default=0)
+    return density, path.stat().st_size, path.as_posix().lower()
+
+
+def harmony_media_name(path: Path) -> str:
+    """把 Android 图片文件名转换为合法的 HarmonyOS 资源名。"""
+    filename = path.name
+    if filename.lower().endswith(".9.png"):
+        filename = filename[:-6]
+    else:
+        filename = path.stem
+    normalized = re.sub(r"[^a-zA-Z0-9_]", "_", filename)
+    return normalized or "resource"
 
 
 # ============================================================
@@ -154,6 +210,7 @@ class ResourceMigrator:
         self.android_root = Path(android_project_path)
         self.harmony_root = Path(harmony_output_path)
         self.mapping = ResourceMapping()
+        self._selected_media: dict[str, tuple[Path, Path]] = {}
 
     def run(self) -> ResourceMapping:
         """执行完整迁移"""
@@ -314,30 +371,12 @@ class ResourceMigrator:
         if not res_dir:
             return
 
-        media_dir = self.harmony_root / "entry/src/main/resources/base/media"
-        supported = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'}
-
-        for drawable_dir in sorted(res_dir.glob("drawable*")):
-            if not drawable_dir.is_dir():
-                continue
-
-            for img_file in sorted(drawable_dir.iterdir()):
-                if img_file.suffix.lower() not in supported:
-                    continue
-
-                # 直接用文件名（去密度后缀），例如 ic_add.png
-                dest = media_dir / img_file.name
-                shutil.copy2(img_file, dest)
-
-                name = img_file.stem  # 不带扩展名的文件名
-                self.mapping.entries.append(ResourceEntry(
-                    android_path=str(img_file),
-                    android_ref=f"R.drawable.{name}",
-                    harmony_path=str(dest.relative_to(self.harmony_root)),
-                    harmony_key=name,
-                    value=str(dest),
-                    resource_type="drawable",
-                ))
+        self._migrate_media_type(
+            res_dir=res_dir,
+            directory_pattern="drawable*",
+            supported=MEDIA_SUFFIXES,
+            resource_type="drawable",
+        )
 
         drawable_count = sum(1 for e in self.mapping.entries if e.resource_type == "drawable")
         if drawable_count:
@@ -349,41 +388,77 @@ class ResourceMigrator:
         if not res_dir:
             return
 
-        media_dir = self.harmony_root / "entry/src/main/resources/base/media"
-
-        for mipmap_dir in sorted(res_dir.glob("mipmap*")):
-            if not mipmap_dir.is_dir():
-                continue
-
-            for img_file in sorted(mipmap_dir.iterdir()):
-                if img_file.suffix.lower() not in {'.png', '.jpg', '.webp'}:
-                    continue
-
-                # 同名的只保留第一个（最高分辨率不要覆盖最新的）
-                dest = media_dir / img_file.name
-                if dest.exists():
-                    # 选择更大的文件
-                    if img_file.stat().st_size > dest.stat().st_size:
-                        shutil.copy2(img_file, dest)
-                else:
-                    shutil.copy2(img_file, dest)
-
-                name = img_file.stem
-                # 避免重复添加同一个 ref
-                ref = f"R.mipmap.{name}"
-                if ref not in {e.android_ref for e in self.mapping.entries}:
-                    self.mapping.entries.append(ResourceEntry(
-                        android_path=str(img_file),
-                        android_ref=ref,
-                        harmony_path=str(dest.relative_to(self.harmony_root)),
-                        harmony_key=name,
-                        value=str(dest),
-                        resource_type="mipmap",
-                    ))
+        self._migrate_media_type(
+            res_dir=res_dir,
+            directory_pattern="mipmap*",
+            supported={'.png', '.jpg', '.jpeg', '.webp'},
+            resource_type="mipmap",
+        )
 
         mipmap_count = sum(1 for e in self.mapping.entries if e.resource_type == "mipmap")
         if mipmap_count:
             print(f"  mipmap → media/ ({mipmap_count} 项)")
+
+    def _migrate_media_type(
+        self,
+        res_dir: Path,
+        directory_pattern: str,
+        supported: set[str],
+        resource_type: str,
+    ):
+        """按 HarmonyOS 逻辑资源名迁移图片，同名不同扩展名只能保留一个。"""
+        candidates: dict[str, Path] = {}
+        display_names: dict[str, str] = {}
+        for resource_dir in sorted(res_dir.glob(directory_pattern)):
+            if not resource_dir.is_dir():
+                continue
+            for image in sorted(resource_dir.iterdir()):
+                if not image.is_file() or image.suffix.lower() not in supported:
+                    continue
+                resource_name = harmony_media_name(image)
+                key = resource_name.casefold()
+                current = candidates.get(key)
+                if current is None or _media_priority(image) > _media_priority(current):
+                    candidates[key] = image
+                    display_names[key] = resource_name
+
+        media_dir = self.harmony_root / "entry/src/main/resources/base/media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        for key in sorted(candidates):
+            source = candidates[key]
+            name = display_names[key]
+            dest = self._install_media_candidate(key, name, source, media_dir)
+            self.mapping.entries.append(ResourceEntry(
+                android_path=str(source),
+                android_ref=f"R.{resource_type}.{name}",
+                harmony_path=str(dest.relative_to(self.harmony_root)),
+                harmony_key=dest.stem,
+                value=str(dest),
+                resource_type=resource_type,
+            ))
+
+    def _install_media_candidate(
+        self, key: str, resource_name: str, source: Path, media_dir: Path
+    ) -> Path:
+        """安装当前最佳图片，并同步更新此前指向同一逻辑名的映射。"""
+        selected = self._selected_media.get(key)
+        if selected is None or _media_priority(source) > _media_priority(selected[0]):
+            for existing in media_dir.iterdir():
+                if (existing.is_file()
+                        and harmony_media_name(existing).casefold() == key
+                        and existing.suffix.lower() in MEDIA_SUFFIXES):
+                    existing.unlink()
+            dest = media_dir / f"{resource_name}{source.suffix.lower()}"
+            shutil.copy2(source, dest)
+            self._selected_media[key] = (source, dest)
+            for entry in self.mapping.entries:
+                if entry.harmony_key.casefold() == key and entry.resource_type in {"drawable", "mipmap"}:
+                    entry.harmony_path = str(dest.relative_to(self.harmony_root))
+                    entry.harmony_key = dest.stem
+                    entry.value = str(dest)
+            return dest
+
+        return selected[1]
 
     # ---- 辅助方法 ----
 

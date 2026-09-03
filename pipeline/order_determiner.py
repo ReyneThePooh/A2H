@@ -2,10 +2,10 @@
 
 import os
 import json
-import time
 from pathlib import Path
 from dataclasses import dataclass, field
-from openai import OpenAI
+
+from hello_agents.core.llm import HelloAgentsLLM
 
 from analyzers.static import (
     JavaStaticAnalyzer, XmlStaticAnalyzer,
@@ -17,6 +17,9 @@ from analyzers.tools import ToolRegistry, _summary_to_dict
 from pipeline.static_graph import (
     norm_path, build_file_graph, build_hard_groups,
     layered_topological_sort, validate_plan, export_artifacts,
+)
+from pipeline.agents import (
+    create_pipeline_llm, UnitBuildAgent, DependencyReviewAgent,
 )
 
 
@@ -30,81 +33,6 @@ class Unit:
     name: str
     sources: list[str] = field(default_factory=list)  # 包含的源文件路径
     description: str = ""  # 单元功能描述（LLM 生成）
-
-
-# ============================================================
-# LLM 客户端封装
-# ============================================================
-
-class LLMClient:
-    """轻量 LLM 封装 — 直接使用 OpenAI API"""
-
-    def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv("LLM_API_KEY"),
-            base_url=os.getenv("LLM_BASE_URL"),
-            timeout=int(os.getenv("LLM_TIMEOUT", "120")),
-        )
-        self.model = os.getenv("LLM_MODEL_ID", "gpt-3.5-turbo")
-
-    def chat(self, messages: list[dict], tools: list[dict] | None = None,
-             tool_choice: str = "auto") -> dict:
-        """发送请求并返回响应消息"""
-        kwargs = dict(
-            model=self.model,
-            messages=messages,
-            temperature=0.3,
-        )
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice
-
-        response = self.client.chat.completions.create(**kwargs)
-        msg = response.choices[0].message
-        return {
-            "content": msg.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                }
-                for tc in (msg.tool_calls or [])
-            ],
-        }
-
-    def chat_with_tools(self, messages: list[dict], tools: list[dict],
-                        tool_executor, max_rounds: int = 6) -> str:
-        """带工具调用的对话循环，返回最终文本"""
-        for _ in range(max_rounds):
-            result = self.chat(messages, tools=tools)
-
-            if result["tool_calls"]:
-                # 把助手消息加入历史
-                assistant_msg = {"role": "assistant", "content": result["content"]}
-                if result["tool_calls"]:
-                    tool_call_blocks = []
-                    for tc in result["tool_calls"]:
-                        tool_call_blocks.append({
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                        })
-                    assistant_msg["tool_calls"] = tool_call_blocks
-                messages.append(assistant_msg)
-
-                # 执行工具调用
-                for tc in result["tool_calls"]:
-                    tool_result = tool_executor(tc["name"], json.loads(tc["arguments"]))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": tool_result,
-                    })
-            else:
-                return result["content"]
-
-        return result["content"]
 
 
 # ============================================================
@@ -146,7 +74,7 @@ def scan_project(project_path: str, src_dir: str = "app/src/main") -> dict[str, 
 class SummaryGenerator:
     """为项目所有文件生成摘要"""
 
-    def __init__(self, llm: LLMClient):
+    def __init__(self, llm: HelloAgentsLLM):
         self.llm = llm
 
     def generate_all(self, project_path: str, files: dict[str, str],
@@ -245,8 +173,8 @@ class SummaryGenerator:
 只返回JSON。"""
 
         try:
-            result = self.llm.chat([{"role": "user", "content": prompt}])
-            data = self._parse_json(result["content"])
+            result = self.llm.invoke([{"role": "user", "content": prompt}])
+            data = self._parse_json(result)
             if data:
                 s.class_purpose = data.get("class_purpose", "")
                 s.class_role = data.get("class_role", "")
@@ -303,8 +231,8 @@ class SummaryGenerator:
 只返回JSON。"""
 
         try:
-            result = self.llm.chat([{"role": "user", "content": prompt}])
-            data = self._parse_json(result["content"])
+            result = self.llm.invoke([{"role": "user", "content": prompt}])
+            data = self._parse_json(result)
             if data:
                 s.purpose = data.get("purpose", "")
                 s.layout_pattern = data.get("layout_pattern", "")
@@ -488,50 +416,9 @@ class SummaryGenerator:
 # ============================================================
 
 class UnitBuilder:
-    """LLM Agent — 将文件分组为翻译单元"""
+    """将文件分组为翻译单元 — LLM 部分委托给 UnitBuildAgent"""
 
-    UNIT_BUILDER_PROMPT = """你是一个Android项目架构分析专家。你的任务是将给定的文件列表分组为"翻译单元(Unit)"。
-
-## 什么是翻译单元
-一个翻译单元是一组应该一起翻译的源文件，翻译后会生成一个 .ets 文件。合理的单元划分应该：
-- 功能内聚：完成同一功能的 Java 和 XML 放在一起
-- 大小适中：每单元 1-5 个文件为宜
-- 一个 Activity/Fragment + 其布局 XML + 其 Adapter → 一个单元
-- 独立的工具类、数据模型 → 各自一个单元
-
-## 可用工具
-- get_all_summaries: 列出所有文件
-- get_file_summary: 查看文件详细摘要
-- read_file_region: 读取文件指定行（仅在摘要不够时使用）
-
-## 任务
-根据项目的文件列表和摘要，将文件分组为翻译单元。
-
-## 硬绑定约束（必须遵守）
-输入中会给出"硬绑定组"——通过静态分析确定的强耦合文件组
-（如 Activity 与它 setContentView 的布局、Adapter 与它 inflate 的 item 布局、布局与它 include 的子布局）。
-每个硬绑定组内的文件必须放在同一个单元中，不允许拆散。可以把多个硬绑定组合并进同一个单元，但不能拆分。
-
-## 输出格式
-请严格按照以下JSON格式输出（不要markdown包裹）：
-{
-  "units": [
-    {
-      "name": "单元名称（中文，简短描述功能）",
-      "sources": ["相对路径1.java", "相对路径2.xml"],
-      "description": "单元功能简述"
-    }
-  ],
-  "reasoning": "划分思路简述"
-}
-
-注意：
-1. sources 必须是原始文件路径，与 get_all_summaries 中列出的路径一致
-2. 每个文件必须且只能属于一个单元
-3. 确保所有文件都被分配到某个单元中
-4. 硬绑定组内的文件必须在同一单元"""
-
-    def __init__(self, llm: LLMClient, tools: ToolRegistry):
+    def __init__(self, llm: HelloAgentsLLM, tools: ToolRegistry):
         self.llm = llm
         self.tools = tools
 
@@ -543,9 +430,7 @@ class UnitBuilder:
             f"- 组{i + 1}: {', '.join(g)}" for i, g in enumerate(hard_groups)
         ) or "（无）"
 
-        messages = [
-            {"role": "system", "content": self.UNIT_BUILDER_PROMPT},
-            {"role": "user", "content": f"""请为以下项目划分翻译单元。
+        prompt = f"""请为以下项目划分翻译单元。
 
 ## Java 文件 ({len(java_files)} 个)
 {chr(10).join(java_files)}
@@ -557,14 +442,9 @@ class UnitBuilder:
 {hard_groups_text}
 
 请先使用 get_all_summaries 了解全貌，然后对关键文件使用 get_file_summary 查看详情，最后输出单元划分。"""
-             },
-        ]
 
-        result = self.llm.chat_with_tools(
-            messages,
-            tools=self.tools.get_tool_schemas(),
-            tool_executor=lambda name, args: self.tools.execute(name, args),
-        )
+        agent = UnitBuildAgent(self.llm, self.tools)
+        result = agent.run(prompt)
 
         data = SummaryGenerator._parse_json(result)
         if not data:
@@ -680,40 +560,11 @@ class UnitDependencyAnalyzer:
     """确定 unit 之间的依赖关系
 
     静态第一遍：把文件级依赖图（类型引用 / import / Intent / 布局引用）投影到 unit 级，
-    覆盖同包无 import 的引用；LLM 第二遍只负责审核和补充静态无法确定的隐式依赖。
+    覆盖同包无 import 的引用；LLM 第二遍（DependencyReviewAgent）只负责审核和补充
+    静态无法确定的隐式依赖。
     """
 
-    DEPENDENCY_PROMPT = """你是一个Java项目依赖分析专家。你的任务是审核并补充翻译单元之间的依赖关系。
-
-## 背景
-已经通过静态分析（AST 类型引用、import、Intent 跳转、布局引用）得到了初步依赖图。
-静态分析仍可能遗漏的情况：
-1. 通过反射、字符串类名动态加载
-2. 隐式协议依赖（共享 SharedPreferences key、广播 action、数据库表结构）
-
-## 可用工具
-- get_file_summary: 查看文件详细摘要
-- read_file_region: 读取文件指定行
-
-## 任务
-基于给出的静态依赖结果，补充确实存在但被遗漏的依赖。不要删除静态分析得到的依赖。
-
-## 输出格式
-严格按以下JSON格式输出：
-{
-  "dependencies": {
-    "单元A": ["单元B", "单元C"],
-    "单元B": ["单元C"]
-  },
-  "reasoning": "依赖分析说明"
-}
-
-注意：
-- 边方向：键是依赖方，值是它依赖的单元列表。"单元A": ["单元B"] 表示 A 依赖 B（B 必须先于 A 翻译）
-- 单元名必须与输入中给定的完全一致
-- 只输出确实存在的依赖，宁缺毋滥"""
-
-    def __init__(self, llm: LLMClient, tools: ToolRegistry, summaries: dict,
+    def __init__(self, llm: HelloAgentsLLM, tools: ToolRegistry, summaries: dict,
                  file_graph: dict[str, set[str]] | None = None):
         self.llm = llm
         self.tools = tools
@@ -787,15 +638,8 @@ class UnitDependencyAnalyzer:
 请输出依赖关系 JSON。"""
 
         try:
-            messages = [
-                {"role": "system", "content": self.DEPENDENCY_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
-            final = self.llm.chat_with_tools(
-                messages,
-                tools=self.tools.get_tool_schemas(),
-                tool_executor=lambda name, args: self.tools.execute(name, args),
-            )
+            agent = DependencyReviewAgent(self.llm, self.tools)
+            final = agent.run(prompt)
 
             print(f"  LLM 原始输出: {final[:300]}...")
 
@@ -871,7 +715,7 @@ class OrderDeterminer:
     def __init__(self, project_path: str, cache_dir: str = ".pipeline_cache"):
         self.project_path = Path(project_path)
         self.cache_dir = self.project_path / cache_dir
-        self.llm = LLMClient()
+        self.llm = create_pipeline_llm()
         self.summaries: dict[str, FileSummary | XmlSummary] = {}
 
     def run(self) -> tuple[list[list[Unit]], dict[str, set[str]]]:

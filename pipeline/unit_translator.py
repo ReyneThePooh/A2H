@@ -1,68 +1,16 @@
 """Unit 翻译器 — Planner 决策 + 自动组装源码 → Executor 翻译"""
 
 import json
-import os
 from pathlib import Path
 from dataclasses import dataclass, field
-from openai import OpenAI
+
+from hello_agents.core.llm import HelloAgentsLLM
 
 from analyzers.tools import ToolRegistry, _summary_to_dict
 from pipeline.order_determiner import Unit
-
-
-# ============================================================
-# LLM 客户端
-# ============================================================
-
-class LLMClient:
-    def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv("LLM_API_KEY"),
-            base_url=os.getenv("LLM_BASE_URL"),
-            timeout=int(os.getenv("LLM_TIMEOUT", "180")),
-        )
-        self.model = os.getenv("LLM_MODEL_ID", "deepseek-v4-flash")
-
-    def chat(self, messages: list[dict], tools: list[dict] | None = None,
-             temperature: float = 0.3, **kwargs) -> dict:
-        kw = dict(model=self.model, messages=messages, temperature=temperature, **kwargs)
-        if tools:
-            kw["tools"] = tools
-        response = self.client.chat.completions.create(**kw)
-        msg = response.choices[0].message
-        return {
-            "content": msg.content or "",
-            "tool_calls": [
-                {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
-                for tc in (msg.tool_calls or [])
-            ],
-        }
-
-    def invoke(self, messages: list[dict], temperature: float = 0.3, **kwargs) -> str:
-        """无工具调用，直接返回文本"""
-        kw = dict(model=self.model, messages=messages, temperature=temperature, **kwargs)
-        response = self.client.chat.completions.create(**kw)
-        return response.choices[0].message.content or ""
-
-    def chat_with_tools(self, messages: list[dict], tools: list[dict],
-                        tool_executor, max_rounds: int = 8) -> str:
-        for _ in range(max_rounds):
-            result = self.chat(messages, tools=tools)
-            if result["tool_calls"]:
-                assistant_msg: dict = {"role": "assistant", "content": result["content"]}
-                tool_blocks = [
-                    {"id": tc["id"], "type": "function",
-                     "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                    for tc in result["tool_calls"]
-                ]
-                assistant_msg["tool_calls"] = tool_blocks
-                messages.append(assistant_msg)
-                for tc in result["tool_calls"]:
-                    tool_result = tool_executor(tc["name"], json.loads(tc["arguments"]))
-                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_result})
-            else:
-                return result["content"]
-        return result["content"]
+from pipeline.agents import (
+    create_pipeline_llm, TranslationPlanAgent, UnitTranslateAgent,
+)
 
 
 # ============================================================
@@ -101,78 +49,6 @@ class TranslationResult:
     address: str = ""
     success: bool = False
     error: str = ""
-
-
-# ============================================================
-# Planner
-# ============================================================
-
-PLANNER_PROMPT = """你是一个 Android → HarmonyOS 代码翻译规划专家。
-
-## 任务
-分析翻译单元中的源文件，决定:
-1. 输出几个 .ets 文件及其顺序
-2. 每个文件分几步翻译
-3. 每一步需要读取哪些源文件的哪些行
-
-## 可用工具
-- get_all_summaries(): 列出项目文件
-- get_file_summary(文件名): 查看文件详细摘要（方法签名、行号、字段、资源引用等）
-
-## 决策规则
-
-### 简单文件 → type="simple", plan 为空
-- 单文件 Java（工具类/数据模型），无关联 XML，行数 < 200
-- 单个 XML 布局
-
-### 复杂文件 → type="planned", plan 含 2-4 步
-- Java Activity + XML 布局
-- 多个关联文件需协同翻译
-
-## read_regions 格式
-摘要中每个方法、字段都有精确行号，请根据这些行号指定:
-- "L1-L28"  (import 区域)
-- "L30-L40" (类声明和字段)
-- "L42-L87" (具体方法)
-
-## 输出格式（严格 JSON）
-{{
-  "outputs": [
-    {{
-      "file": "DbHelper.ets",
-      "order": 0,
-      "type": "simple",
-      "sources": ["DbHelper.java"],
-      "depends_on": [],
-      "description": "数据库工具类"
-    }},
-    {{
-      "file": "MainPage.ets",
-      "order": 0,
-      "type": "planned",
-      "sources": ["MainActivity.java", "activity_main.xml"],
-      "plan": [
-        {{
-          "step": "翻译 import 和 @State 变量",
-          "read_regions": [
-            {{"file": "MainActivity.java", "lines": "L1-L35"}},
-            {{"file": "activity_main.xml", "lines": "L1-L30"}}
-          ]
-        }},
-        {{
-          "step": "翻译 build() 方法",
-          "read_regions": [
-            {{"file": "activity_main.xml", "lines": "L1-L40"}}
-          ]
-        }}
-      ],
-      "depends_on": [],
-      "description": "欢迎页面"
-    }}
-  ]
-}}
-
-只输出 JSON。"""
 
 
 # ============================================================
@@ -396,13 +272,15 @@ class SourceReader:
 # ============================================================
 
 class UnitTranslator:
-    def __init__(self, llm: LLMClient, tools: ToolRegistry,
+    def __init__(self, llm: HelloAgentsLLM, tools: ToolRegistry,
                  harmony_root: str, summaries: dict):
         self.llm = llm
         self.tools = tools
         self.harmony_root = Path(harmony_root)
         self.summaries = summaries
         self.reader = SourceReader(tools.project_root)
+        self.planner_agent = TranslationPlanAgent(llm, tools)
+        self.translate_agent = UnitTranslateAgent(llm, tools)
 
     def translate(self, unit: Unit, dep_summaries: str,
                   unit_output_cache: dict[str, str]) -> list[TranslationResult]:
@@ -461,13 +339,7 @@ class UnitTranslator:
 先用 get_all_summaries 和 get_file_summary 了解文件结构，然后输出翻译方案。"""
 
         try:
-            result = self.llm.chat_with_tools(
-                [{"role": "system", "content": PLANNER_PROMPT},
-                 {"role": "user", "content": prompt}],
-                tools=self.tools.get_tool_schemas(),
-                tool_executor=lambda n, a: self.tools.execute(n, a),
-                max_rounds=6,
-            )
+            result = self.planner_agent.run(prompt)
             data = _parse_json(result)
             if data:
                 outputs = []
@@ -517,12 +389,7 @@ class UnitTranslator:
             data = _parse_json(result)
             if not data:
                 # 回退：带工具再试一次
-                result = self.llm.chat_with_tools(
-                    [{"role": "user", "content": prompt}],
-                    tools=self.tools.get_tool_schemas(),
-                    tool_executor=lambda n, a: self.tools.execute(n, a),
-                    max_rounds=3,
-                )
+                result = self.translate_agent.run(prompt)
                 data = _parse_json(result)
             if data and data.get("code"):
                 print(f"    ✓ {len(data['code'])} 字符")
@@ -571,12 +438,7 @@ class UnitTranslator:
                 data = _parse_json(result)
                 if not data:
                     # 回退：带工具
-                    result = self.llm.chat_with_tools(
-                        [{"role": "user", "content": prompt}],
-                        tools=self.tools.get_tool_schemas(),
-                        tool_executor=lambda n, a: self.tools.execute(n, a),
-                        max_rounds=3,
-                    )
+                    result = self.translate_agent.run(prompt)
                     data = _parse_json(result)
                 if data:
                     accumulated = data.get("code", accumulated)
@@ -636,7 +498,7 @@ class TranslationPipeline:
     def __init__(self, project_root: str, harmony_root: str,
                  summaries: dict, resource_mapping_path: str):
         self.project_root = project_root
-        self.llm = LLMClient()
+        self.llm = create_pipeline_llm()
         self.tools = ToolRegistry(project_root, summaries, resource_mapping_path)
         self.translator = UnitTranslator(self.llm, self.tools, harmony_root, summaries)
         self.summaries = summaries

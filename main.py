@@ -9,6 +9,8 @@
 """
 
 import argparse
+import ctypes
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,11 +24,26 @@ from hello_agents.core.path_config import (
     HARMONY_WORK_BASE_DIR,
 )
 from pipeline.order_determiner import OrderDeterminer
-from pipeline.resource_migrator import ResourceMigrator, parse_manifest
+from pipeline.resource_migrator import (
+    ResourceMigrator,
+    parse_manifest,
+    reset_generated_artifacts,
+)
 from pipeline.unit_translator import TranslationPipeline, TranslationResult
-from pipeline.project_packager import package_project, rewrite_flat_imports
+from pipeline.project_packager import (
+    ResourceValidationError,
+    package_project,
+    rewrite_flat_imports,
+)
 from pipeline.build_fixer import BuildFixLoop
 
+
+if os.name == "nt":
+    try:
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+    except (AttributeError, OSError):
+        pass
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -134,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     layers, deps = determiner.run()
 
     # 2. 静态资源迁移（翻译前执行，翻译器依赖 .resource_mapping.json 提供资源提示）
+    reset_generated_artifacts(generated_root)
     migrator = ResourceMigrator(str(android_root), str(generated_root))
     migrator.run()
 
@@ -154,12 +172,16 @@ def main(argv: list[str] | None = None) -> int:
     # 4. 套模板打包
     manifest = find_manifest(android_root)
     permissions = parse_manifest(str(manifest))["permissions"] if manifest else []
-    package_project(
-        template_dir=template_root,
-        generated_dir=generated_root,
-        output_dir=packaged_root,
-        android_permissions=permissions,
-    )
+    try:
+        package_project(
+            template_dir=template_root,
+            generated_dir=generated_root,
+            output_dir=packaged_root,
+            android_permissions=permissions,
+        )
+    except ResourceValidationError as error:
+        print(f"\n❌ {error}")
+        return 1
 
     # 5. 构建 + 反思修复闭环（修复写入打包工程，并同步回生成工程）
     fix_result = BuildFixLoop(max_fix_rounds=args.max_fix_rounds).run(
