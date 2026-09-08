@@ -1,0 +1,50 @@
+# diff_tester 配置样例。复制为 config.yaml 后按需修改，
+# 运行时通过 --config config.yaml 传入。所有键与默认值见 diff_tester/config.py。
+
+device:
+  # 本机实测路径（不在 PATH 中时必须写全路径）
+  adb_path: "E:\\Android\\Sdk\\platform-tools\\adb.exe"
+  hdc_path: "E:\\DevEcoStudio\\DevEco Studio\\sdk\\default\\openharmony\\toolchains\\hdc.exe"
+  # 序列号可省略（单设备时自动选择），也可在 CLI 用 --device 指定
+  android_serial: null
+  harmony_serial: null
+  cmd_timeout_s: 30.0
+  cmd_retries: 1
+  stable_timeout_s: 10.0     # 界面稳定判据超时
+  stable_interval_s: 0.5
+  launch_wait_s: 3.0
+  harmony_ability: "EntryAbility"   # aa start 的 ability 名，按被测 HAP 修改
+
+matcher:
+  # 控件对齐器权重（缺失分量的权重按比例摊给其余分量）
+  w_id: 0.35
+  w_text: 0.25
+  w_role: 0.10
+  w_pos: 0.15
+  w_img: 0.15
+  th_hi: 0.75      # >= th_hi 且与第二名差距 >= min_gap → MATCHED
+  th_lo: 0.55      # [th_lo, th_hi) 或差距不足 → AMBIGUOUS
+  min_gap: 0.10
+
+oracle:
+  jaccard_min: 0.90          # 掩码文本 multiset Jaccard 下限
+  widget_align_min: 0.80     # 控件对齐率下限
+  widget_text_sim_min: 0.80
+  page_stem_sim_min: 0.75    # 页面名启发式匹配阈值（page_pairs 无条目时）
+  enable_l3: true            # L3 感知哈希距离（仅记录，不判失败）
+
+explorer:
+  back_prob: 0.10
+  long_click_prob: 0.05
+  swipe_prob: 0.05
+  novelty_weight: 2.0
+  visited_weight: 1.0
+  random_seed: null          # 固定整数可复现探索序列
+  # type_corpus 可整体覆盖（默认含邮箱/手机号/超长串/emoji/空串/SQL特殊串）
+
+# 文本掩码正则（追加/覆盖默认值，命中替换为 <VOLATILE>）
+# mask_patterns:
+#   - '\d{1,2}:\d{2}(:\d{2})?'
+
+# 平台差异白名单（归因阶段 PLATFORM 判定）
+whitelist_path: "whitelist.example.yaml"

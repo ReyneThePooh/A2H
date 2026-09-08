@@ -1,0 +1,152 @@
+{
+  "attributes": {
+    "type": "root",
+    "id": "",
+    "text": "",
+    "bounds": "[0,0][1080,1920]",
+    "clickable": "false",
+    "enabled": "true",
+    "pagePath": "pages/Index"
+  },
+  "children": [
+    {
+      "attributes": {
+        "type": "Text",
+        "id": "tv_title",
+        "text": "我的应用",
+        "bounds": "[40,80][400,160]",
+        "clickable": "false",
+        "enabled": "true"
+      },
+      "children": []
+    },
+    {
+      "attributes": {
+        "type": "Image",
+        "id": "btn_settings",
+        "text": "",
+        "description": "设置",
+        "bounds": "[960,80][1040,160]",
+        "clickable": "true",
+        "enabled": "true"
+      },
+      "children": []
+    },
+    {
+      "attributes": {
+        "type": "TextInput",
+        "id": "et_username",
+        "text": "",
+        "description": "用户名",
+        "bounds": "[84,400][996,520]",
+        "clickable": "true",
+        "enabled": "true"
+      },
+      "children": []
+    },
+    {
+      "attributes": {
+        "type": "Checkbox",
+        "id": "cb_remember",
+        "text": "记住我",
+        "bounds": "[84,560][400,640]",
+        "clickable": "true",
+        "checked": "false",
+        "enabled": "true"
+      },
+      "children": []
+    },
+    {
+      "attributes": {
+        "type": "List",
+        "id": "rv_items",
+        "text": "",
+        "bounds": "[0,700][1080,1600]",
+        "clickable": "false",
+        "enabled": "true"
+      },
+      "children": [
+        {
+          "attributes": {
+            "type": "ListItem",
+            "id": "",
+            "text": "",
+            "bounds": "[0,700][1080,1000]",
+            "clickable": "true",
+            "enabled": "true"
+          },
+          "children": [
+            {
+              "attributes": {
+                "type": "Text",
+                "id": "item_text",
+                "text": "条目一",
+                "bounds": "[40,750][600,850]",
+                "clickable": "false",
+                "enabled": "true"
+              },
+              "children": []
+            }
+          ]
+        },
+        {
+          "attributes": {
+            "type": "ListItem",
+            "id": "",
+            "text": "",
+            "bounds": "[0,1000][1080,1300]",
+            "clickable": "true",
+            "enabled": "true"
+          },
+          "children": [
+            {
+              "attributes": {
+                "type": "Text",
+                "id": "item_text",
+                "text": "条目二",
+                "bounds": "[40,1050][600,1150]",
+                "clickable": "false",
+                "enabled": "true"
+              },
+              "children": []
+            }
+          ]
+        },
+        {
+          "attributes": {
+            "type": "ListItem",
+            "id": "",
+            "text": "",
+            "bounds": "[0,1300][1080,1600]",
+            "clickable": "true",
+            "enabled": "true"
+          },
+          "children": [
+            {
+              "attributes": {
+                "type": "Text",
+                "id": "item_text",
+                "text": "条目三",
+                "bounds": "[40,1350][600,1450]",
+                "clickable": "false",
+                "enabled": "true"
+              },
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "attributes": {
+        "type": "Button",
+        "id": "btn_login",
+        "text": "登录",
+        "bounds": "[84,1650][996,1782]",
+        "clickable": "true",
+        "enabled": "true"
+      },
+      "children": []
+    }
+  ]
+}

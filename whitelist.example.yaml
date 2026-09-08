@@ -1,0 +1,16 @@
+# 平台固有差异白名单：分叉详情命中任一正则 → 归类 PLATFORM（不计翻译扣分）。
+# 由预实验人工构建并随案例增长（设计文档 §4.8）。
+patterns:
+  # 权限弹窗文本
+  - "允许.*(访问|使用|获取)"
+  - "是否允许"
+  - "权限申请"
+  - "仅在使用中允许"
+  # 系统 UI 组件
+  - "com\\.android\\.systemui"
+  - "com\\.android\\.permissioncontroller"
+  - "com\\.ohos\\.systemui"
+  - "com\\.ohos\\.permissionmanager"
+  # 系统对话框 / 输入法
+  - "com\\.android\\.inputmethod"
+  - "com\\.huawei\\.hmos\\.inputmethod"

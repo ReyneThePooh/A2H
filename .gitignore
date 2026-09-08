@@ -185,3 +185,7 @@ artifacts/
 
 # PPT 排版任务的本地工作缓存
 .pptx-layout-work/
+
+# 差分测试门禁运行产物
+.pytest_tmp/
+.diff_gate/

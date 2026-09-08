@@ -6,6 +6,8 @@
 3. TranslationPipeline — 按层翻译各 unit，产出 .ets 到生成工程
 4. package_project   — 翻译产物套 DevEco 模板，注入权限、注册页面
 5. BuildFixLoop      — assembleHap 构建 → 错误解析 → LLM 反思修复 → 重新构建验证
+6. FunctionalFixLoop — （--enable-diff-gate）差分测试门禁：部署 HAP → 种子轨迹
+   语义回放（L0–L2 预言）→ 分叉报告 → LLM 功能修复 → 重建 → 再门禁
 """
 
 import argparse
@@ -89,6 +91,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="自动构建修复轮数上限（默认：3）",
     )
+    parser.add_argument(
+        "--enable-diff-gate",
+        action="store_true",
+        help="构建通过后运行差分测试门禁（轻量环内版）并进入功能修复环",
+    )
+    parser.add_argument(
+        "--max-gate-rounds",
+        type=int,
+        default=3,
+        help="门禁-修复迭代轮数上限（默认：3）",
+    )
+    parser.add_argument(
+        "--harmony-device",
+        help="hdc 设备序列号（默认取 .env HARMONY_DEVICE；单设备可省略）",
+    )
+    parser.add_argument(
+        "--seeds-dir",
+        help="种子轨迹目录（默认取 .env DIFF_GATE_SEEDS_DIR 或门禁工作目录下 seeds/）",
+    )
+    parser.add_argument(
+        "--gate-workspace",
+        help="门禁工作目录（默认取 .env DIFF_GATE_WORKSPACE 或 <工程>/.diff_gate）",
+    )
+    parser.add_argument(
+        "--bundle",
+        help="鸿蒙应用 bundleName（默认从工程 AppScope/app.json5 读取）",
+    )
     return parser.parse_args(argv)
 
 
@@ -108,12 +137,67 @@ def print_build_summary(fix_result: dict) -> None:
         print(f"    ... 还有 {len(remaining) - 5} 个")
 
 
+def run_diff_gate_stage(project_dir: Path, sync_dir: Path | None, args) -> bool:
+    """构建通过后的差分测试门禁 + 功能修复环（--enable-diff-gate）。
+
+    契约文件（unit_page_map.json / page_pairs.json）自动从
+    translation_plan.json 生成；种子轨迹需预先放在门禁工作目录 seeds/ 下
+    （或用 --seeds-dir 指定）。
+    """
+    from pipeline.functional_fixer import FunctionalFixLoop
+    from pipeline.gate_bridge import prepare_workspace
+
+    workspace = Path(
+        args.gate_workspace
+        or os.getenv("DIFF_GATE_WORKSPACE", "").strip()
+        or (project_dir / ".diff_gate")
+    )
+    seeds_dir = args.seeds_dir or os.getenv("DIFF_GATE_SEEDS_DIR", "").strip() or None
+    device = args.harmony_device or os.getenv("HARMONY_DEVICE", "").strip() or None
+    hdc_path = os.getenv("HDC_PATH", "").strip() or None
+
+    plan_path = Path(ANDROID_PROJECT_DIR) / ".pipeline_cache" / "translation_plan.json"
+    if plan_path.exists():
+        prepare_workspace(workspace, plan_path)
+    else:
+        print(f"⚠️ 找不到 {plan_path}，无法生成契约文件；增量选择将退化为全量回放")
+        plan_path = None
+
+    print(f"\n{'=' * 60}")
+    print("🚦 差分测试门禁（轻量环内版）")
+    print(f"{'=' * 60}")
+    print(f"  工作目录: {workspace}")
+
+    loop = FunctionalFixLoop(max_gate_rounds=args.max_gate_rounds)
+    try:
+        result = loop.run(
+            project_dir, sync_dir, workspace,
+            seeds_dir=seeds_dir, bundle=args.bundle,
+            device=device, hdc_path=hdc_path, plan_path=plan_path,
+        )
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"\n❌ 门禁无法运行: {e}")
+        return False
+
+    if result["success"]:
+        print(f"\n✅ 功能一致性门禁通过（共 {result['rounds']} 轮）")
+    else:
+        n = len(result.get("needs_human", []))
+        print(f"\n❌ 门禁未通过，{n} 个缺陷挂起待人工介入"
+              f"（分叉报告与历史见 {workspace / 'history'}）")
+    return bool(result["success"])
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = parse_args(argv)
 
     if args.max_fix_rounds < 0:
         print("❌ --max-fix-rounds 必须大于或等于 0")
+        return 2
+
+    if args.max_gate_rounds < 1:
+        print("❌ --max-gate-rounds 必须大于或等于 1")
         return 2
 
     if args.sync_dir and not args.resume:
@@ -137,7 +221,11 @@ def main(argv: list[str] | None = None) -> int:
             project_dir, sync_dir=sync_dir
         )
         print_build_summary(fix_result)
-        return 0 if fix_result["success"] else 1
+        if not fix_result["success"]:
+            return 1
+        if args.enable_diff_gate:
+            return 0 if run_diff_gate_stage(project_dir, sync_dir, args) else 1
+        return 0
 
     android_root = Path(ANDROID_PROJECT_DIR)
     generated_root = Path(HARMONY_SOURCE_PROJECT_DIR)
@@ -194,7 +282,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  翻译: 成功 {sum(r.success for r in results)} / 共 {len(results)} 个输出")
     print(f"  工程: {packaged_root}")
     print_build_summary(fix_result)
-    return 0 if fix_result["success"] else 1
+    if not fix_result["success"]:
+        return 1
+
+    # 6. 差分测试门禁 + 功能修复环（可选，--enable-diff-gate）
+    if args.enable_diff_gate:
+        return 0 if run_diff_gate_stage(packaged_root, generated_root, args) else 1
+    return 0
 
 
 if __name__ == "__main__":

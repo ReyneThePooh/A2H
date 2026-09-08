@@ -9,6 +9,16 @@ networkx>=2.6.0,<4.0.0
 tiktoken>=0.5.0
 javalang>=0.13.0                  # Java AST 静态分析（pipeline 依赖提取）
 
+# 差分测试门禁 (diff_tester) - 必需
+rapidfuzz>=3.0                    # 控件对齐/预言的字符串相似度
+PyYAML>=6.0                       # config.yaml 覆盖配置
+pytest>=8.0                       # 离线单元测试
+# 差分测试 - 设备侧可选（真机/模拟器回放时安装）
+# uiautomator2>=3.0               # 安卓端录制
+# hmdriver2>=1.0                  # 鸿蒙端回放加速（缺省走 hdc uitest 兜底）
+# Pillow>=10.0                    # L3 视觉参考（环内门禁不启用）
+# ImageHash>=4.3
+
 # 搜索功能依赖 - 可选安装: pip install hello-agents[search]
 # tavily-python>=0.7.12
 # google-search-results>=2.4.2
