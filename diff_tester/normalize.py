@@ -46,6 +46,7 @@ HARMONY_ROLE_RULES: list[tuple[str, str]] = [
     ("SearchField", "textfield"),
     ("Search", "textfield"),
     ("Checkbox", "checkbox"),
+    ("Radio", "checkbox"),         # 单选按钮与 checkbox 同类交互
     ("Toggle", "switch"),
     ("Switch", "switch"),
     ("Button", "button"),
@@ -204,6 +205,10 @@ def _build_harmony(node: dict[str, Any], sw: int, sh: int) -> UNode:
 
     node_id = str(a.get("id", "") or a.get("key", "") or "") or None
     text = str(a.get("text", "") or "")
+    if "Radio" in typ:
+        # Radio 的 text 暴露的是 value 属性（如 'easy'），屏幕上不可见，
+        # 计入页面文本会与旁侧可见标签重复 → 置空
+        text = ""
     desc = str(a.get("description", "") or "")
 
     children = [_build_harmony(c, sw, sh) for c in _hm_children(node)]

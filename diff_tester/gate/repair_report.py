@@ -107,6 +107,19 @@ class RepairReport:
         ]
         if self.expected.get("values"):
             lines.append(f"- 期望值状态: {self.expected['values']}")
+        if self.failure_type == "ALIGN_FAIL":
+            lines.append(
+                "目标控件指纹（安卓端录制）: "
+                f"role={target.get('role', '?')}, "
+                f"id={target.get('id_hint', '') or '无'}, "
+                f"text={target.get('text', '') or '无'}, "
+                f"desc={target.get('desc', '') or '无'}, "
+                f"归一化位置={target.get('rel_bounds')}")
+            lines.append(
+                "修复提示: 回放器按 id/文本/位置匹配控件。若安卓控件有 id 而鸿蒙"
+                "组件未设置，请给对应 ArkTS 组件补 .id('<与安卓一致的id>')；"
+                "外观相同的同类控件（如网格中的格子）必须逐个设置与安卓 "
+                "android:id 一致的 id，否则回放器无法区分它们。")
         if self.suspect_units:
             lines.append(f"疑似问题单元: {self.suspect_units}")
         if self.prior_steps_summary:

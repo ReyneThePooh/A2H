@@ -12,6 +12,7 @@ from collections import Counter
 from typing import TYPE_CHECKING, Optional
 
 from .config import DEFAULT_MASK_PATTERNS
+from .matcher import _subtree_text
 from .schemas import StateVector, UNode
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -85,7 +86,8 @@ def build_state_vector(
 
     for n in tree.iter_interactive():
         if n.role in _WIDGET_ROLES:
-            label = mask_text(n.text or n.desc, masks)
+            # 子树文本兜底：ArkTS Button(){Text()} 结构文本挂在子节点上
+            label = mask_text(n.text or n.desc or _subtree_text(n), masks)
             widgets.setdefault(n.role, []).append(label)
     for r in widgets:
         widgets[r].sort()

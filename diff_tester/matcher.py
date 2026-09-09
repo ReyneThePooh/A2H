@@ -20,6 +20,7 @@ _COMPATIBLE_ROLES: set[frozenset[str]] = {
     frozenset(("button", "image")),      # 图标按钮两端角色易漂移
     frozenset(("button", "text")),       # 可点击文本 vs 按钮
     frozenset(("button", "listitem")),
+    frozenset(("button", "checkbox")),   # 安卓 RadioButton→button vs 鸿蒙 Radio→checkbox
     frozenset(("text", "listitem")),
     frozenset(("checkbox", "switch")),
     frozenset(("list", "container")),
@@ -30,12 +31,38 @@ def _roles_compatible(a: str, b: str) -> bool:
     return frozenset((a, b)) in _COMPATIBLE_ROLES
 
 
+def _subtree_text(c: UNode, limit: int = 3) -> str:
+    """候选自身无文本时收集子树文本。
+
+    ArkTS 常见 Button() { Text('xxx') } 结构：文本挂在子节点上，
+    Button 节点本身 text 为空，需向下兜底。
+    """
+    parts: list[str] = []
+
+    def rec(n: UNode) -> None:
+        if len(parts) >= limit:
+            return
+        if n.text:
+            parts.append(n.text)
+        for ch in n.children:
+            rec(ch)
+
+    rec(c)
+    return " ".join(parts)
+
+
 def _sim_text(fp: TargetFingerprint, c: UNode) -> Optional[float]:
     a = fp.text or fp.desc
-    b = c.text or c.desc
     if not a:
         return None            # 指纹无文本 → 分量缺失，权重转移
-    return fuzz.ratio(a, b) / 100.0
+    b = c.text or c.desc or _subtree_text(c)
+    if not b:
+        # 候选端完全无文本（如翻译丢失 contentDescription 的图标）→
+        # 视为分量缺失而非 0 分，交由 id/pos/img 分量判别。
+        return None
+    # 大小写不敏感：安卓 Button 默认 textAllCaps 渲染为全大写，
+    # 而鸿蒙保留资源原文，属平台系统性渲染差异，不应影响匹配。
+    return fuzz.ratio(a.casefold(), b.casefold()) / 100.0
 
 
 def _sim_id(fp: TargetFingerprint, c: UNode) -> Optional[float]:

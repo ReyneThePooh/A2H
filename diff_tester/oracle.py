@@ -85,6 +85,15 @@ class PagePairs:
 # L2 子谓词
 # ---------------------------------------------------------------------------
 
+def _fold_multiset(d: dict[str, int]) -> dict[str, int]:
+    """按 casefold 归并文本多重集：吸收安卓 textAllCaps 等平台渲染差异。"""
+    out: dict[str, int] = {}
+    for k, n in d.items():
+        kk = k.casefold()
+        out[kk] = out.get(kk, 0) + n
+    return out
+
+
 def multiset_jaccard(a: dict[str, int], b: dict[str, int]) -> float:
     """multiset Jaccard：J = Σ min(a,b) / Σ max(a,b)；两者皆空 → 1.0。"""
     keys = set(a) | set(b)
@@ -99,8 +108,14 @@ def widget_align_rate(
     expected: dict[str, list[str]],
     actual: dict[str, list[str]],
     text_sim_min: float = 0.8,
+    page_texts: Optional[dict[str, int]] = None,
 ) -> float:
-    """expected.widgets 中控件在 actual 找到匹配的比例（text+role 贪心对齐）。"""
+    """expected.widgets 中控件在 actual 找到匹配的比例（text+role 贪心对齐）。
+
+    page_texts（casefold 后的页面文本多重集）作最后兜底：控件标签渲染结构
+    跨端漂移（如安卓 RadioButton 自带标签 vs 鸿蒙 Radio+旁侧 Text），
+    只要标签文本仍在页面上且存在可交互控件，即视为对齐。
+    """
     total = 0
     aligned = 0
     for role, labels in expected.items():
@@ -113,12 +128,17 @@ def widget_align_rate(
             total += 1
             best_i, best_s = -1, -1.0
             for i, cand in enumerate(pool):
-                s = fuzz.ratio(lab, cand) / 100.0
+                s = fuzz.ratio(lab.casefold(), cand.casefold()) / 100.0
                 if s > best_s:
                     best_i, best_s = i, s
             if best_i >= 0 and best_s >= text_sim_min:
                 aligned += 1
                 pool.pop(best_i)
+            elif page_texts:
+                lf = lab.casefold()
+                if any(fuzz.ratio(lf, k) / 100.0 >= text_sim_min
+                       for k in page_texts):
+                    aligned += 1
     return aligned / total if total else 1.0
 
 
@@ -145,7 +165,7 @@ def compare_keyed(
         else:
             best_k, best_s = None, 0.0
             for k2 in unused:
-                s = fuzz.ratio(k, k2) / 100.0
+                s = fuzz.ratio(k.casefold(), k2.casefold()) / 100.0
                 if s > best_s:
                     best_k, best_s = k2, s
             if best_k is not None and best_s >= fuzzy_key_min:
@@ -186,8 +206,11 @@ def compare(
         })
 
     # ---- L2 语义内容 --------------------------------------------------------
-    jac = multiset_jaccard(expected.texts, actual.texts)
-    align = widget_align_rate(expected.widgets, actual.widgets, cfg.widget_text_sim_min)
+    exp_texts = _fold_multiset(expected.texts)
+    act_texts = _fold_multiset(actual.texts)
+    jac = multiset_jaccard(exp_texts, act_texts)
+    align = widget_align_rate(expected.widgets, actual.widgets,
+                              cfg.widget_text_sim_min, page_texts=act_texts)
     value_mismatches = compare_keyed(expected.values, actual.values)
     list_mismatches = compare_keyed(expected.list_counts, actual.list_counts)
 
@@ -209,8 +232,8 @@ def compare(
              and not value_mismatches
              and not list_mismatches)
     if not l2_ok:
-        detail["missing_texts"] = _multiset_diff(expected.texts, actual.texts)[:20]
-        detail["extra_texts"] = _multiset_diff(actual.texts, expected.texts)[:20]
+        detail["missing_texts"] = _multiset_diff(exp_texts, act_texts)[:20]
+        detail["extra_texts"] = _multiset_diff(act_texts, exp_texts)[:20]
         return OracleVerdict(passed=False, kind="L2_CONTENT", detail=detail)
 
     return OracleVerdict(passed=True, kind=None, detail=detail)

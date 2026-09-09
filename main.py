@@ -168,12 +168,15 @@ def run_diff_gate_stage(project_dir: Path, sync_dir: Path | None, args) -> bool:
     print(f"{'=' * 60}")
     print(f"  工作目录: {workspace}")
 
+    time_budget_s = float(os.getenv("DIFF_GATE_TIME_BUDGET_S", "300") or 300)
+
     loop = FunctionalFixLoop(max_gate_rounds=args.max_gate_rounds)
     try:
         result = loop.run(
             project_dir, sync_dir, workspace,
             seeds_dir=seeds_dir, bundle=args.bundle,
             device=device, hdc_path=hdc_path, plan_path=plan_path,
+            time_budget_s=time_budget_s,
         )
     except (FileNotFoundError, RuntimeError) as e:
         print(f"\n❌ 门禁无法运行: {e}")
