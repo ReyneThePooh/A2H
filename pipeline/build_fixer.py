@@ -149,7 +149,14 @@ SYSTEM_PROMPT = """你是HarmonyOS ArkTS代码专家，擅长：
 
 # 按错误码/关键词附加的修复提示
 ERROR_KNOWLEDGE = {
-    "arkts-no-any-unknown": "ArkTS禁止any/unknown，改为具体类型；装饰器参数用Object等具体类型",
+    "arkts-no-types-in-catch": (
+        "catch 子句禁止类型标注：写 catch (e) {}，"
+        "在函数体内用 const err = e as Error（或 BusinessError）收窄后再访问属性"
+    ),
+    "arkts-no-any-unknown": (
+        "ArkTS禁止any/unknown，改为具体类型；装饰器参数用Object等具体类型。"
+        "例外：catch (e) 的参数必须保持无类型标注，这不算违规"
+    ),
     "arkts-no-ctor-signatures-funcs": "ArkTS不支持 new (...args)=>T 构造函数类型，用类或接口替代",
     "TS2304": "找不到名称，常见于Android组件未转换（如TextView→Text）或缺少导入",
     "TS2322": "类型不匹配，检查属性类型或回调函数签名",
@@ -187,6 +194,8 @@ REFLECT_PROMPT = """请作为资深ArkTS代码审查员检查以下修复方案�
 {content}
 
 请评估修复是否完整、是否引入新的ArkTS规范违规（any/unknown、构造函数类型等）。
+注意：try-catch 的 catch (e) 参数不带类型标注是 ArkTS 的强制要求（arkts-no-types-in-catch），
+这是正确写法，不要建议给 catch 参数补类型。
 如果没有问题，只回答"无需改进"；否则具体指出问题。
 """
 
@@ -306,6 +315,33 @@ class BuildFixLoop:
 
     # ---- 单轮修复 ----
 
+    # catch 子句类型标注（arkts-no-types-in-catch）是纯语法问题，直接正则移除，
+    # 不进 LLM。注意保留 Promise .catch((e: T) => ...) 回调参数标注（合法写法）。
+    CATCH_TYPE_RE = re.compile(
+        r"(?<![.\w])catch\s*\(\s*([A-Za-z_$][\w$]*)\s*:\s*[^)]+\)"
+    )
+    CATCH_ERROR_KEYS = (
+        "arkts-no-types-in-catch",
+        "Catch clause variable type annotation",
+    )
+
+    @classmethod
+    def _apply_deterministic_rules(
+        cls, source: str, errors: list[dict]
+    ) -> tuple[str, list[dict]]:
+        """先用确定性规则修复可机械处理的错误，返回 (新代码, 剩余错误)。"""
+        catch_errors = [
+            err for err in errors
+            if any(key in str(err.get("message", "")) for key in cls.CATCH_ERROR_KEYS)
+        ]
+        if not catch_errors:
+            return source, errors
+        fixed = cls.CATCH_TYPE_RE.sub(r"catch (\1)", source)
+        if fixed == source:
+            return source, errors
+        remaining = [err for err in errors if err not in catch_errors]
+        return fixed, remaining
+
     def _fix_files(self, project_dir: Path, sync_dir: Optional[Path],
                    errors: list[dict]):
         by_file: dict[Path, list[dict]] = {}
@@ -325,7 +361,17 @@ class BuildFixLoop:
                 print(f"    ❌ 读取失败: {e}")
                 continue
 
-            fixed = self._reflection_fix(str(rel), source, file_errors)
+            base, llm_errors = self._apply_deterministic_rules(source, file_errors)
+            if base != source:
+                fixed_count = len(file_errors) - len(llm_errors)
+                print(f"    🔧 确定性修复: 已移除 catch 子句类型标注（{fixed_count} 个错误）")
+
+            fixed = base
+            if llm_errors:
+                llm_fixed = self._reflection_fix(str(rel), base, llm_errors)
+                if llm_fixed:
+                    fixed = llm_fixed
+
             if not fixed or fixed == source:
                 print("    ⚠️ 未产生有效修改")
                 continue
