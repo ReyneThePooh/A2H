@@ -13,6 +13,7 @@
 """
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -21,17 +22,61 @@ from hello_agents.agents.function_call_agent import FunctionCallAgent
 
 
 # ============================================================
+# 瞬态错误自动重试
+# ============================================================
+
+#: 判定为"可重试的瞬态错误"的关键词（匹配异常消息，忽略大小写）
+_TRANSIENT_PATTERNS = ("connection", "timed out", "timeout", "429",
+                       "rate limit", "502", "503", "504", "temporarily")
+_MAX_ATTEMPTS = 3        # 总尝试次数（首次 + 2 次重试）
+_BASE_DELAY_S = 2.0      # 指数退避基数：2s → 4s
+
+
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(p in msg for p in _TRANSIENT_PATTERNS)
+
+
+def _retry_transient(fn, what: str):
+    """执行 fn()；瞬态网络错误指数退避重试，非瞬态错误（如鉴权失败）立即抛出。"""
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == _MAX_ATTEMPTS or not _is_transient(e):
+                raise
+            delay = _BASE_DELAY_S * (2 ** (attempt - 1))
+            print(f"      ⏳ {what}瞬态错误，{delay:.0f}s 后重试"
+                  f"（{attempt}/{_MAX_ATTEMPTS - 1}）: {str(e)[:80]}")
+            time.sleep(delay)
+
+
+class RetryingLLM(HelloAgentsLLM):
+    """invoke 自动重试瞬态错误的 HelloAgentsLLM。
+
+    网关抖动（Connection error / Request timed out / 5xx / 限流）在长流水线中
+    难以避免，一次失败即放弃会浪费整个翻译单元。
+    """
+
+    def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
+        return _retry_transient(
+            lambda: super(RetryingLLM, self).invoke(messages, **kwargs),
+            "LLM 调用",
+        )
+
+
+# ============================================================
 # LLM 工厂
 # ============================================================
 
 def create_pipeline_llm(temperature: float = 0.3) -> HelloAgentsLLM:
-    """构造流水线使用的 HelloAgentsLLM。
+    """构造流水线使用的 HelloAgentsLLM（带瞬态错误重试）。
 
     HelloAgentsLLM 与原 LLMClient 读取相同的环境变量
     （LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL / LLM_TIMEOUT），
     仅超时默认值不同，这里显式保持流水线原默认 180 秒。
     """
-    return HelloAgentsLLM(
+    return RetryingLLM(
         temperature=temperature,
         timeout=int(os.getenv("LLM_TIMEOUT", "180")),
     )
@@ -130,6 +175,14 @@ class PipelineAgent(FunctionCallAgent):
     def run(self, input_text: str, **kwargs) -> str:
         self.clear_history()
         return super().run(input_text, **kwargs)
+
+    def _invoke_with_tools(self, messages, tools, tool_choice, **kwargs):
+        # 带工具的调用绕过 llm.invoke 直连 OpenAI 客户端，须在此补瞬态重试
+        return _retry_transient(
+            lambda: super(PipelineAgent, self)._invoke_with_tools(
+                messages, tools, tool_choice, **kwargs),
+            "LLM 工具调用",
+        )
 
 
 # ============================================================

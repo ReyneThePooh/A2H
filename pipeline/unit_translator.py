@@ -1,6 +1,8 @@
 """Unit 翻译器 — Planner 决策 + 自动组装源码 → Executor 翻译"""
 
+import hashlib
 import json
+import os
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -281,12 +283,63 @@ class UnitTranslator:
         self.reader = SourceReader(tools.project_root)
         self.planner_agent = TranslationPlanAgent(llm, tools)
         self.translate_agent = UnitTranslateAgent(llm, tools)
+        # 跨进程翻译缓存：同模型、同源码的单元重跑时直接复用译文
+        self._trans_cache_path = (Path(tools.project_root)
+                                  / ".pipeline_cache" / "unit_translations.json")
+        self._trans_cache = self._load_trans_cache()
+
+    # ---- 翻译缓存 ----
+
+    def _load_trans_cache(self) -> dict:
+        try:
+            with open(self._trans_cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_trans_cache(self):
+        try:
+            self._trans_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._trans_cache_path, "w", encoding="utf-8") as f:
+                json.dump(self._trans_cache, f, ensure_ascii=False)
+        except OSError as e:
+            print(f"  ⚠️ 翻译缓存写入失败: {e}")
+
+    def _trans_cache_key(self, unit: Unit) -> str:
+        """模型 ID + 源文件路径 + 源码内容 的哈希。
+
+        不含 unit 名（LLM 划分可能改名）；源码或模型一变即失效。
+        删除 .pipeline_cache/unit_translations.json 可强制全部重译。
+        """
+        payload = "\n".join([
+            os.getenv("LLM_MODEL_ID", ""),
+            "\n".join(sorted(unit.sources)),
+            self.reader.read_all(sorted(unit.sources)),
+        ])
+        return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
 
     def translate(self, unit: Unit, dep_summaries: str,
                   unit_output_cache: dict[str, str]) -> list[TranslationResult]:
         print(f"\n{'─' * 50}")
         print(f"翻译 Unit: {unit.name} ({len(unit.sources)} 文件)")
         print(f"{'─' * 50}")
+
+        # 0. 命中跨进程缓存 → 直接写盘返回，不花 LLM 调用
+        try:
+            cache_key = self._trans_cache_key(unit)
+        except OSError:
+            cache_key = None
+        cached = self._trans_cache.get(cache_key) if cache_key else None
+        if cached:
+            print(f"  ✓ 命中翻译缓存（{len(cached['outputs'])} 个文件），跳过 LLM 调用")
+            results = []
+            for out in cached["outputs"]:
+                self._write(out["file"], out["code"])
+                unit_output_cache[out["file"]] = self._api_summary(out["code"])
+                results.append(TranslationResult(
+                    unit_name=unit.name, file_name=out["file"],
+                    code=out["code"], success=True))
+            return results
 
         # 1. Planner: 只读摘要，输出方案（含 read_regions）
         outputs = self._plan(unit, dep_summaries)
@@ -323,6 +376,15 @@ class UnitTranslator:
             if result.success:
                 unit_output_cache[o.file] = self._api_summary(result.code)
                 self._write(o.file, result.code)
+
+        # 整单元全部成功才入缓存（部分失败的单元下次重跑仍会完整重译）
+        if cache_key and results and all(r.success for r in results):
+            self._trans_cache[cache_key] = {
+                "unit": unit.name,
+                "outputs": [{"file": r.file_name, "code": r.code}
+                            for r in results],
+            }
+            self._save_trans_cache()
 
         return results
 
