@@ -22,6 +22,16 @@ class CommandError(RuntimeError):
     """外部命令失败（含原始命令与 stderr）。"""
 
 
+class LaunchCrashError(RuntimeError):
+    """reset_app 冷启动后应用即崩溃/退出（回放器据此直接判 L0_CRASH）。"""
+
+    def __init__(self, message: str, crash_sig: Optional[str] = None,
+                 alive: bool = False):
+        super().__init__(message)
+        self.crash_sig = crash_sig
+        self.alive = alive
+
+
 def run_command(
     args: list[str],
     timeout_s: float = 30.0,

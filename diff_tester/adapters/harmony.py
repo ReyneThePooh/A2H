@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..normalize import find_harmony_page_hint, parse_harmony_dump
 from ..schemas import AbstractEvent, UNode
-from .base import CommandError, DeviceAdapter, run_command
+from .base import CommandError, DeviceAdapter, LaunchCrashError, run_command
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -102,11 +102,23 @@ class HarmonyAdapter(DeviceAdapter):
     def reset_app(self) -> None:
         self._hdc("shell", "bm", "clean", "-n", self.bundle, "-d", check=False)
         self._hdc("shell", "aa", "force-stop", self.bundle, check=False)
+        # 崩溃基线必须在启动前快照：若启动即崩，faultlogger 新文件才可被
+        # poll_crash 检出（此前基线在启动后快照，会把启动崩溃"吞"进基线）
+        self._snapshot_faults()
         self._hdc("shell", "aa", "start", "-a", self.ability, "-b", self.bundle,
                   check=False)
         time.sleep(self.cfg.device.launch_wait_s)
         self.wait_stable()
-        self._snapshot_faults()   # 重置崩溃基线
+        # 启动健康检查：进程死亡或产生崩溃文件 → 抛类型化异常，
+        # 回放器据此直接判 L0_CRASH，避免误诊为控件映射失败
+        crash_sig = self.poll_crash()
+        alive = self.app_alive()
+        if crash_sig or not alive:
+            raise LaunchCrashError(
+                f"应用 {self.bundle} 启动后即崩溃/退出"
+                f"（alive={alive}, crash_sig={crash_sig}）",
+                crash_sig=crash_sig, alive=alive,
+            )
 
     def dump_tree(self) -> UNode:
         data = self._dump_raw()
@@ -274,6 +286,22 @@ class HarmonyAdapter(DeviceAdapter):
 
     def _snapshot_faults(self) -> None:
         self._fault_baseline = self._list_faults()
+
+    def read_fault(self, crash_sig: str, max_chars: int = 6000) -> str:
+        """读取崩溃文件内容（Error message + Stacktrace 在文件头部）。
+
+        crash_sig 为 poll_crash 返回的文件名（可能带 " (bundle未确认)" 后缀）。
+        """
+        name = crash_sig.split(" ")[0].strip()
+        if not name or not _FAULT_RE.search(name):
+            return ""
+        for d in _FAULT_DIRS:
+            cp = self._hdc("shell", "cat", f"{d}/{name}", check=False,
+                           timeout=30)
+            out = cp.stdout or ""
+            if cp.returncode == 0 and out and "No such file" not in out:
+                return out[:max_chars]
+        return ""
 
     def app_alive(self) -> bool:
         cp = self._hdc("shell", f"pidof {self.bundle}", check=False)

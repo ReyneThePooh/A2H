@@ -8,6 +8,7 @@ from pipeline.build_fixer import BuildFixLoop, ErrorParser
 from pipeline.project_packager import (
     InvalidResourceNameError,
     ResourceConflictError,
+    find_component_new_violations,
     find_invalid_resource_names,
     find_resource_name_conflicts,
     validate_resource_names,
@@ -137,3 +138,37 @@ def test_build_fix_loop_stops_before_hvigor_on_resource_conflict(tmp_path: Path)
     assert result["builds"] == 0
     assert result["initial_errors_count"] == 1
     assert result["remaining_errors"][0]["code"] == "RESOURCE_CONFLICT"
+
+
+def test_find_component_new_violations(tmp_path: Path):
+    pages = tmp_path / "entry/src/main/ets/pages"
+    pages.mkdir(parents=True)
+    # 组件声明在一个文件，new 违规在另一个文件（跨文件收集组件名）
+    (pages / "RainAdapter.ets").write_text(
+        "@Component\nexport struct RainAdapter {\n  build() {}\n}\n",
+        encoding="utf-8")
+    (pages / "MainPage.ets").write_text(
+        "import { RainAdapter } from './RainAdapter';\n"
+        "@Entry\n@Component\nexport struct MainPage {\n"
+        "  aboutToAppear(): void {\n"
+        "    this.x = new RainAdapter({ rainDataList: [] });\n"
+        "  }\n"
+        "  build() { RainAdapter() }\n"   # 声明式使用不算违规
+        "}\n",
+        encoding="utf-8")
+    # 普通类的 new 不受影响
+    (pages / "DataModel.ets").write_text(
+        "export class DataModel {}\nconst d = new DataModel();\n",
+        encoding="utf-8")
+
+    violations = find_component_new_violations(tmp_path)
+
+    assert violations == [{
+        "file": "entry/src/main/ets/pages/MainPage.ets",
+        "line": 6,
+        "component": "RainAdapter",
+    }]
+
+
+def test_find_component_new_violations_empty_project(tmp_path: Path):
+    assert find_component_new_violations(tmp_path) == []

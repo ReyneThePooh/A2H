@@ -10,6 +10,7 @@ import os
 import shutil
 from typing import TYPE_CHECKING, Optional
 
+from .adapters.base import LaunchCrashError
 from .config import Config
 from .matcher import match
 from .oracle import PagePairs, compare
@@ -45,7 +46,21 @@ def replay(
                               if ev.post_state and ev.post_state.page}),
     )
 
-    harmony.reset_app()
+    try:
+        harmony.reset_app()
+    except LaunchCrashError as e:
+        # 启动即崩溃：不进控件匹配，直接判 L0_CRASH（step 0 = 启动阶段）
+        logger.error("[replay] %s 应用启动即崩溃: %s", trace.trace_id, e)
+        rec = StepRecord(step=0, action="launch", expected_page="")
+        rec.verdict_kind, rec.passed = "L0_CRASH", False
+        result.steps.append(rec)
+        _finalize_divergence(result, trace, 0, None, "L0_CRASH",
+                             {"phase": "launch", "alive": e.alive,
+                              "crash_sig": e.crash_sig},
+                             None, harmony, masks,
+                             os.path.join(trace_dir, "step0"),
+                             collect_artifacts)
+        return result
 
     for ev in trace.events:
         step_dir = os.path.join(trace_dir, f"step{ev.step}")
@@ -65,7 +80,7 @@ def replay(
                                trace.trace_id, ev.step, e)
                 rec.verdict_kind, rec.passed = kind, False
                 result.steps.append(rec)
-                _finalize_divergence(result, trace, ev, kind,
+                _finalize_divergence(result, trace, ev.step, ev.post_state, kind,
                                      {"error": f"dump_tree: {e}"},
                                      None, harmony, masks, step_dir,
                                      collect_artifacts)
@@ -85,7 +100,7 @@ def replay(
                                trace.trace_id, ev.step, kind, m.score)
                 rec.verdict_kind, rec.passed = kind, False
                 result.steps.append(rec)
-                _finalize_divergence(result, trace, ev, kind,
+                _finalize_divergence(result, trace, ev.step, ev.post_state, kind,
                                      {"match": m.detail,
                                       "score": round(m.score, 4),
                                       "second_score": round(m.second_score, 4),
@@ -104,7 +119,7 @@ def replay(
                            trace.trace_id, ev.step, e)
             rec.verdict_kind, rec.passed = kind, False
             result.steps.append(rec)
-            _finalize_divergence(result, trace, ev, kind,
+            _finalize_divergence(result, trace, ev.step, ev.post_state, kind,
                                  {"error": str(e)}, None, harmony, masks,
                                  step_dir, collect_artifacts)
             return result
@@ -129,7 +144,8 @@ def replay(
                 detail = dict(verdict.detail)
                 if rec.unstable:
                     detail["unstable"] = True   # 归因阶段降低该步置信度
-                _finalize_divergence(result, trace, ev, verdict.kind, detail,
+                _finalize_divergence(result, trace, ev.step, ev.post_state,
+                                     verdict.kind, detail,
                                      actual, harmony, masks, step_dir,
                                      collect_artifacts)
                 return result
@@ -149,7 +165,8 @@ def replay(
 def _finalize_divergence(
     result: TraceResult,
     trace: Trace,
-    ev,
+    step: int,
+    post_state,
     kind: str,
     detail: dict,
     actual,
@@ -158,9 +175,12 @@ def _finalize_divergence(
     step_dir: str,
     collect_artifacts: bool,
 ) -> None:
-    """填写分叉报告并收集 artifacts（两端截图、鸿蒙 dump、日志尾 200 行）。"""
+    """填写分叉报告并收集 artifacts（两端截图、鸿蒙 dump、日志尾 200 行）。
+
+    step=0 表示启动阶段分叉（无对应事件/基线）。
+    """
     result.passed = False
-    result.first_divergence_step = ev.step
+    result.first_divergence_step = step
 
     if collect_artifacts:
         os.makedirs(step_dir, exist_ok=True)
@@ -170,6 +190,41 @@ def _finalize_divergence(
                 actual = alpha(harmony, masks, step_dir, "harmony")
             except Exception as e:
                 logger.warning("补采鸿蒙状态失败: %s", e)
+
+    # 分叉定性校正：执行类分叉若源于进程死亡/崩溃，实为 L0_CRASH。
+    # （启动崩溃在 replay() 入口已单独处理；这里兜住轨迹中途的崩溃）
+    if kind in ("EXEC_UNMAPPED", "EXEC_AMBIGUOUS"):
+        crash_sig, alive = None, True
+        try:
+            if actual is not None:
+                crash_sig, alive = actual.crash_sig, actual.alive
+            else:
+                crash_sig, alive = harmony.poll_crash(), harmony.app_alive()
+        except Exception as e:
+            logger.warning("崩溃改判检查失败: %s", e)
+        if crash_sig or not alive:
+            detail = dict(detail)
+            detail.update({"alive": alive, "crash_sig": crash_sig,
+                           "reclassified_from": kind})
+            kind = "L0_CRASH"
+            if result.steps:
+                result.steps[-1].verdict_kind = kind
+            logger.warning("[replay] %s step=%d 改判为 L0_CRASH"
+                           "（alive=%s, crash_sig=%s）",
+                           trace.trace_id, step, alive, crash_sig)
+
+    if collect_artifacts:
+        # 崩溃栈落盘（修复报告直接引用，免得 LLM 对着 hilog 噪音猜）
+        crash_sig = detail.get("crash_sig")
+        if kind == "L0_CRASH" and crash_sig:
+            try:
+                content = harmony.read_fault(crash_sig)
+                if content:
+                    with open(os.path.join(step_dir, "crash_stack.txt"), "w",
+                              encoding="utf-8") as f:
+                        f.write(content)
+            except Exception as e:
+                logger.warning("读取崩溃文件失败: %s", e)
         try:
             with open(os.path.join(step_dir, "hilog_tail.txt"), "w",
                       encoding="utf-8") as f:
@@ -177,9 +232,9 @@ def _finalize_divergence(
         except Exception as e:
             logger.warning("收集鸿蒙日志失败: %s", e)
         # 安卓端基线附件（拷贝录制时的截图/dump）
-        if ev.post_state:
-            for src, name in ((ev.post_state.screenshot, "android_baseline.png"),
-                              (ev.post_state.dump_path, "android_baseline_dump.json")):
+        if post_state:
+            for src, name in ((post_state.screenshot, "android_baseline.png"),
+                              (post_state.dump_path, "android_baseline_dump.json")):
                 if src and os.path.exists(src):
                     try:
                         shutil.copyfile(src, os.path.join(step_dir, name))
@@ -188,10 +243,10 @@ def _finalize_divergence(
 
     report = DivergenceReport(
         trace_id=trace.trace_id,
-        diverged_step=ev.step,
+        diverged_step=step,
         kind=kind,
         detail=detail,
-        android_state=ev.post_state,
+        android_state=post_state,
         harmony_state=actual,
         artifacts_dir=step_dir if collect_artifacts else "",
     )

@@ -14,6 +14,7 @@ from typing import Any, Optional
 from hello_agents.core.llm import HelloAgentsLLM
 
 from pipeline.project_packager import (
+    find_component_new_violations,
     find_invalid_resource_names,
     find_resource_name_conflicts,
     run_hvigor,
@@ -288,8 +289,28 @@ class BuildFixLoop:
             build_ok = result.returncode == 0
 
             if build_ok and not errors:
-                print(f"\n✅ 构建通过（第 {builds} 次构建）")
-                return self._result(True, builds, initial_count or 0, [])
+                # 编译通过 ≠ 运行时安全：ArkUI 语义静态检查
+                # （new @Component 编译不报错，但启动即 TypeError 闪退）
+                violations = find_component_new_violations(project_dir)
+                if not violations:
+                    print(f"\n✅ 构建通过（第 {builds} 次构建）")
+                    return self._result(True, builds, initial_count or 0, [])
+                errors = [{
+                    "file": str(v["file"]),
+                    "line": int(v["line"]),
+                    "column": 1,
+                    "message": (
+                        f"ArkUI 组件 '{v['component']}' 是 @Component struct，"
+                        "禁止用 new 手动实例化（编译可通过，但运行时在框架"
+                        "构造器抛 TypeError: undefined is not callable，"
+                        "导致启动闪退）。组件只能在 build() 中声明式使用；"
+                        "若该 new 调用是 Android Adapter 直译残留的死代码，"
+                        "请删除对应字段声明与全部赋值语句。"
+                    ),
+                    "code": "ARKUI_NEW_COMPONENT",
+                } for v in violations]
+                print(f"\n❌ 构建通过，但 ArkUI 静态检查发现 "
+                      f"{len(errors)} 处 new @Component 违规")
 
             if initial_count is None:
                 initial_count = len(errors)
@@ -368,7 +389,12 @@ class BuildFixLoop:
 
             fixed = base
             if llm_errors:
-                llm_fixed = self._reflection_fix(str(rel), base, llm_errors)
+                # 错误多时跳过审查轮：整文件重写 + 再审查极易超过网关 120s
+                do_reflect = len(llm_errors) <= 5
+                if not do_reflect:
+                    print(f"    → 错误较多，本轮只做一次修复、跳过审查")
+                llm_fixed = self._reflection_fix(
+                    str(rel), base, llm_errors, do_reflect=do_reflect)
                 if llm_fixed:
                     fixed = llm_fixed
 
@@ -394,13 +420,14 @@ class BuildFixLoop:
                     print(f"    ↩ 已同步回生成工程: {sync_target}")
 
     def _reflection_fix(self, file_path: str, source: str,
-                        errors: list[dict]) -> Optional[str]:
+                        errors: list[dict], do_reflect: bool = True) -> Optional[str]:
         """单文件反思修复：修复 → 审查 → （必要时）改进。真正的验证靠外层重新构建。"""
         errors_text = self._format_errors(errors)
         current = None
         feedback = ""
+        rounds = self.reflect_rounds if do_reflect else 1
 
-        for i in range(self.reflect_rounds):
+        for i in range(rounds):
             if i == 0:
                 prompt = INITIAL_PROMPT.format(
                     file_path=file_path, errors=errors_text, source_code=source)
@@ -415,6 +442,8 @@ class BuildFixLoop:
                 break
             current = fixed
 
+            if not do_reflect:
+                break
             feedback = self._invoke(
                 REFLECT_PROMPT.format(errors=errors_text, content=current))
             if "无需改进" in feedback or "no need" in feedback.lower():

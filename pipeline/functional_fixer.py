@@ -184,7 +184,18 @@ class FunctionalFixLoop:
                 print(f"  ⏱ {report.trace_id}: 超时类缺陷无法自动修复，跳过")
                 continue
 
-            files = unit_ets_files(report.suspect_units, plan, project_dir)
+            # 崩溃栈直接定位的文件最权威，优先于 unit 反查
+            stack_files = [
+                project_dir / rel
+                for rel in getattr(report, "suspect_files", [])
+            ]
+            stack_files = [p for p in stack_files if p.exists()]
+            if stack_files:
+                files = stack_files
+                print(f"  🎯 {report.trace_id}: 崩溃栈定位到 "
+                      f"{[p.name for p in files]}")
+            else:
+                files = unit_ets_files(report.suspect_units, plan, project_dir)
             if not files:
                 pages_dir = project_dir / "entry" / "src" / "main" / "ets" / "pages"
                 files = sorted(pages_dir.glob("*.ets")) if pages_dir.exists() else []

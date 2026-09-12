@@ -221,6 +221,55 @@ def find_invalid_resource_names(resources_root: str | Path) -> list[dict[str, ob
     return sorted(invalid, key=lambda item: str(item["file"]).casefold())
 
 
+# @Component/@ComponentV2 struct 声明（装饰器与 struct 间允许夹其他装饰器，如 @Entry 在前的情形单独匹配）
+_COMPONENT_STRUCT_RE = re.compile(
+    r"@Component(?:V2)?\b\s*(?:@\w+(?:\([^)]*\))?\s*)*(?:export\s+)?struct\s+([A-Za-z_]\w*)"
+)
+
+
+def find_component_new_violations(project_dir: str | Path) -> list[dict[str, object]]:
+    """查找对 ArkUI 组件（@Component struct）的 `new` 手动实例化。
+
+    ArkUI 组件只能由框架在 build() 中声明式创建；`new X(...)` 能通过编译，
+    但运行时在框架基类构造器抛 TypeError（启动即闪退的典型来源，
+    多见于 Android Adapter 直译残留的死代码）。
+
+    返回 [{file(相对 project_dir), line, component}]。
+    """
+    project_dir = Path(project_dir)
+    ets_root = project_dir / "entry" / "src" / "main" / "ets"
+    if not ets_root.exists():
+        return []
+
+    sources: dict[Path, str] = {}
+    component_names: set[str] = set()
+    for f in sorted(ets_root.rglob("*.ets")):
+        try:
+            content = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        sources[f] = content
+        component_names.update(_COMPONENT_STRUCT_RE.findall(content))
+
+    if not component_names:
+        return []
+
+    new_re = re.compile(
+        r"\bnew\s+(" + "|".join(re.escape(n) for n in sorted(component_names)) + r")\s*\("
+    )
+    violations = []
+    for f, content in sources.items():
+        for i, line in enumerate(content.splitlines(), 1):
+            m = new_re.search(line)
+            if m:
+                violations.append({
+                    "file": f.relative_to(project_dir).as_posix(),
+                    "line": i,
+                    "component": m.group(1),
+                })
+    return violations
+
+
 def validate_resource_names(resources_root: str | Path) -> None:
     conflicts = find_resource_name_conflicts(resources_root)
     if conflicts:

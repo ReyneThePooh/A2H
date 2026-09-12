@@ -288,7 +288,7 @@ KIND_TO_DEFECT_TYPE = {
 @dataclass
 class DivergenceReport:
     trace_id: str
-    diverged_step: int                   # 首分叉步号，从 1 开始
+    diverged_step: int                   # 首分叉步号（0 = 启动阶段崩溃）
     kind: str                            # 见 DIVERGENCE_KINDS
     detail: dict                         # 各 kind 专属字段
     android_state: Optional[StateVector]  # 分叉步的安卓基线

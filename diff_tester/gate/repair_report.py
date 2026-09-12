@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -44,6 +45,7 @@ class RepairReport:
     expected: dict                       # 安卓基线: {page, must_have_texts, values, list_counts}
     actual: dict                         # 鸿蒙实况: {page, missing_texts, extra_texts, crash_sig}
     suspect_units: list[str] = field(default_factory=list)
+    suspect_files: list[str] = field(default_factory=list)  # 崩溃栈定位的 ets 相对路径
     prior_steps_summary: list[str] = field(default_factory=list)
     artifacts: dict = field(default_factory=dict)
     flaky_escalated: bool = False        # 由连续 FLAKY 升级而来
@@ -64,6 +66,7 @@ class RepairReport:
             "expected": dict(self.expected),
             "actual": dict(self.actual),
             "suspect_units": list(self.suspect_units),
+            "suspect_files": list(self.suspect_files),
             "prior_steps_summary": list(self.prior_steps_summary),
             "artifacts": dict(self.artifacts),
             "flaky_escalated": self.flaky_escalated,
@@ -80,6 +83,7 @@ class RepairReport:
             expected=dict(d.get("expected", {})),
             actual=dict(d.get("actual", {})),
             suspect_units=list(d.get("suspect_units", [])),
+            suspect_files=list(d.get("suspect_files", [])),
             prior_steps_summary=list(d.get("prior_steps_summary", [])),
             artifacts=dict(d.get("artifacts", {})),
             flaky_escalated=bool(d.get("flaky_escalated", False)),
@@ -91,10 +95,14 @@ class RepairReport:
         target = (self.abstract_event.get("target") or {})
         action = self.abstract_event.get("action", "?")
         target_text = target.get("text") or target.get("id_hint") or ""
+        where = (
+            "在应用冷启动阶段（第一个操作执行前）"
+            if self.diverged_step == 0
+            else f"在第 {self.diverged_step} 步（{action} “{target_text}”）"
+        )
         lines = [
             "## 功能一致性验证失败",
-            f"业务场景: {self.trace_intent}；在第 {self.diverged_step} 步"
-            f"（{action} “{target_text}”）发生分叉。",
+            f"业务场景: {self.trace_intent}；{where}发生分叉。",
             f"失败类型: {self.failure_type}"
             f"（{FAILURE_EXPLAIN.get(self.failure_type, '')}）"
             + ("；注意：该缺陷由连续两轮不稳定复现升级而来" if self.flaky_escalated else ""),
@@ -120,6 +128,14 @@ class RepairReport:
                 "组件未设置，请给对应 ArkTS 组件补 .id('<与安卓一致的id>')；"
                 "外观相同的同类控件（如网格中的格子）必须逐个设置与安卓 "
                 "android:id 一致的 id，否则回放器无法区分它们。")
+        if self.failure_type == "CRASH":
+            stack = self._crash_stack_summary()
+            if stack:
+                lines.append("崩溃栈（faultlogger，Error message 与 Stacktrace "
+                             "指向的应用侧 ets 文件/行号即崩点）:\n```\n"
+                             + stack + "\n```")
+        if self.suspect_files:
+            lines.append(f"崩溃栈定位到的文件: {self.suspect_files}")
         if self.suspect_units:
             lines.append(f"疑似问题单元: {self.suspect_units}")
         if self.prior_steps_summary:
@@ -129,6 +145,25 @@ class RepairReport:
             lines.append("鸿蒙端当前控件树摘要（截断）:\n```\n" + dump_summary + "\n```")
         lines.append("请修复上述翻译单元中与该交互相关的事件处理/状态更新/页面跳转逻辑。")
         return "\n".join(lines)
+
+    def _crash_stack_summary(self, max_chars: int = 1500) -> str:
+        """crash_stack.txt 的头部（Reason/Error message/Stacktrace 都在前面）。"""
+        path = self.artifacts.get("crash_stack", "")
+        if not path or not os.path.exists(path):
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(8000)
+            # 有效信息从 "Reason:" 开始（前面是设备信息头），到 HiLog 段结束
+            start = content.find("Reason:")
+            if start > 0:
+                content = content[start:]
+            cut = content.find("\nHiLog:")
+            if cut > 0:
+                content = content[:cut]
+            return content[:max_chars] + ("…" if len(content) > max_chars else "")
+        except OSError:
+            return ""
 
     def _dump_summary(self, max_chars: int = 1200) -> str:
         path = self.artifacts.get("harmony_dump", "")
@@ -163,6 +198,30 @@ def _texts_list(texts: dict[str, int]) -> list[str]:
             continue
         out.append(k if n == 1 else f"{k} (x{n})")
     return sorted(out)[:_MAX_TEXTS]
+
+
+#: 崩溃栈中的应用侧源文件引用，如 "entry/src/main/ets/pages/MainPage.ets:123"
+_STACK_ETS_RE = re.compile(r"\(?((?:entry|[\w-]+)/src/main/ets/[\w/.-]+\.ets)(?::\d+)?")
+
+
+def suspect_files_from_stack(stack_path: str) -> list[str]:
+    """从 crash_stack.txt 提取应用侧 ets 相对路径（保持栈中出现顺序、去重）。"""
+    if not stack_path or not os.path.exists(stack_path):
+        return []
+    try:
+        with open(stack_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(8000)
+    except OSError:
+        return []
+    cut = content.find("\nHiLog:")
+    if cut > 0:
+        content = content[:cut]
+    seen: list[str] = []
+    for m in _STACK_ETS_RE.finditer(content):
+        rel = m.group(1)
+        if rel not in seen:
+            seen.append(rel)
+    return seen
 
 
 def suspect_units_for_page(page: str, unit_page_map: dict[str, dict]) -> list[str]:
@@ -225,10 +284,15 @@ def build_repair_report(
         artifacts["harmony_screenshot"] = h_state.screenshot
     if h_state and h_state.dump_path:
         artifacts["harmony_dump"] = h_state.dump_path
+    suspect_files: list[str] = []
     if div.artifacts_dir:
         hilog = os.path.join(div.artifacts_dir, "hilog_tail.txt")
         if os.path.exists(hilog):
             artifacts["hilog_tail"] = hilog
+        crash_stack = os.path.join(div.artifacts_dir, "crash_stack.txt")
+        if os.path.exists(crash_stack):
+            artifacts["crash_stack"] = crash_stack
+            suspect_files = suspect_files_from_stack(crash_stack)
 
     return RepairReport(
         trace_id=trace.trace_id,
@@ -239,6 +303,7 @@ def build_repair_report(
         expected=expected,
         actual=actual,
         suspect_units=suspect_units_for_page(expected["page"], unit_page_map),
+        suspect_files=suspect_files,
         prior_steps_summary=prior,
         artifacts=artifacts,
     )
