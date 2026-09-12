@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from hello_agents.core.exceptions import HelloAgentsException
 from hello_agents.core.llm import HelloAgentsLLM
 from hello_agents.agents.function_call_agent import FunctionCallAgent
 
@@ -27,7 +28,8 @@ from hello_agents.agents.function_call_agent import FunctionCallAgent
 
 #: 判定为"可重试的瞬态错误"的关键词（匹配异常消息，忽略大小写）
 _TRANSIENT_PATTERNS = ("connection", "timed out", "timeout", "429",
-                       "rate limit", "502", "503", "504", "temporarily")
+                       "rate limit", "502", "503", "504", "524",
+                       "temporarily")
 _MAX_ATTEMPTS = 3        # 总尝试次数（首次 + 2 次重试）
 _BASE_DELAY_S = 2.0      # 指数退避基数：2s → 4s
 
@@ -54,15 +56,40 @@ def _retry_transient(fn, what: str):
 class RetryingLLM(HelloAgentsLLM):
     """invoke 自动重试瞬态错误的 HelloAgentsLLM。
 
-    网关抖动（Connection error / Request timed out / 5xx / 限流）在长流水线中
-    难以避免，一次失败即放弃会浪费整个翻译单元。
+    默认走流式拉取再拼成完整字符串：Cloudflare 524 的触发条件是
+    「120 秒内未返回完整响应」；流式会边生成边回传，长修复不再被掐断。
+    网关抖动（Connection error / 限流 / 5xx）仍做指数退避重试。
     """
 
     def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
         return _retry_transient(
-            lambda: super(RetryingLLM, self).invoke(messages, **kwargs),
+            lambda: self._invoke_stream(messages, **kwargs),
             "LLM 调用",
         )
+
+    def _invoke_stream(self, messages: list[dict[str, str]], **kwargs) -> str:
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=kwargs.get("temperature", self.temperature),
+                max_tokens=kwargs.get("max_tokens", self.max_tokens),
+                stream=True,
+            )
+            parts: list[str] = []
+            for chunk in response:
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                text = getattr(delta, "content", None) if delta else None
+                if text:
+                    parts.append(text)
+            return "".join(parts)
+        except HelloAgentsException:
+            raise
+        except Exception as e:
+            raise HelloAgentsException(f"LLM调用失败: {e}") from e
 
 
 # ============================================================
