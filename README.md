@@ -1,324 +1,153 @@
-# HelloAgents
+# Android -> HarmonyOS 翻译与差分测试
 
-> 🤖 从零开始构建的多智能体框架 - 轻量级、原生、教学友好
+本项目用于把 Android 项目翻译为 HarmonyOS/ArkTS 工程，并执行资源迁移、工程打包、鸿蒙构建修复和可选的差分回放。
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
-[![OpenAI Compatible](https://img.shields.io/badge/OpenAI-Compatible-green.svg)](https://platform.openai.com/docs/api-reference)
+## 环境要求
 
-HelloAgents是一个专为学习和教学设计的多智能体框架，基于OpenAI原生API构建，提供了从简单对话到复杂推理的完整Agent范式实现。
+- Windows、Python 3.10+
+- Android SDK Platform-Tools（`adb`）
+- DevEco Studio，包含 Node.js、Hvigor、HarmonyOS SDK 和 `hdc`
+- 可访问的 OpenAI 兼容模型服务
+- Android 原项目和 HarmonyOS 模板工程
 
-为了彻底贯彻轻量级与教学友好的理念，HelloAgents在架构上做出了一个关键的简化：除了核心的Agent类，一切皆为Tools。在许多其他框架中需要独立学习的Memory（记忆）、RAG（检索增强生成）、RL（强化学习）、MCP（协议）等模块，在HelloAgents中都被统一抽象为一种“工具”。这种设计的初衷是消除不必要的抽象层，让学习者可以回归到最直观的“智能体调用工具”这一核心逻辑上，从而真正实现快速上手和深入理解的统一。
+需要真实设备回放时，确认 `adb devices` 和 `hdc list targets` 都能识别设备。
 
-## 🚀 快速开始
+## 安装
 
-### 系统要求
+在仓库根目录执行：
 
-- **Python 3.10+** （必需）
-- 支持的操作系统：Windows、macOS、Linux
-
-### 安装
-
-####  标准安装方式
-
-**基础功能（核心Agent）**
-```bash
-pip install hello-agents
+```powershell
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-**按需选择功能模块**
-```bash
-# 搜索功能
-pip install hello-agents[search]
+如果 PowerShell 不允许激活脚本，可以直接使用：
 
-# 记忆系统
-pip install hello-agents[memory]
-
-# RAG文档问答
-pip install hello-agents[rag]
-
-# 记忆+RAG完整功能
-pip install hello-agents[memory-rag]
-
-# 协议系统
-pip install hello-agents[protocols]
-
-# 智能体性能评估
-pip install hello-agents[evaluation]
-
-# 强化学习训练
-pip install hello-agents[rl]
-
-# 全部功能（推荐）
-pip install hello-agents[all]
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-**从源码安装**
-```bash
-git clone https://github.com/your-repo/hello-agents.git
-cd hello-agents
-pip install -e .[all]
+## 配置
+
+复制环境变量模板：
+
+```powershell
+Copy-Item .env.example .env
 ```
 
-#### 🔧 环境配置
+至少填写以下字段：
 
-创建 `.env` 文件：
-```bash
-# 模型名称
-LLM_MODEL_ID=your-model-name
-
-# API密钥
-LLM_API_KEY=your-api-key-here
-
-# 服务地址
-LLM_BASE_URL=your-api-base-url
+```dotenv
+LLM_MODEL_ID=模型名称
+LLM_API_KEY=模型服务密钥
+LLM_BASE_URL=https://模型服务地址/v1
+ANDROID_PROJECT_DIR=C:\path\to\android-project
+HARMONY_TEMPLATE_DIR=E:\path\to\HarmonyTemplate\template
+HARMONY_SOURCE_PROJECT_DIR=E:\path\to\HarmonyProject
+HARMONY_WORK_BASE_DIR=E:\path\to\HarmonyWorkDir
+NODE_HOME=C:\Program Files\Huawei\DevEco Studio\tools\node
 ```
 
-> 📖 详细安装指南请参考 [DEPENDENCIES.md](DEPENDENCIES.md)
+不要把真实密钥提交到 Git。
 
-### 基本使用
+差分测试配置：
 
-```python
-from hello_agents import SimpleAgent, HelloAgentsLLM
-
-# 创建LLM实例 - 框架自动检测provider
-llm = HelloAgentsLLM()
-
-# 或手动指定provider（可选）
-# llm = HelloAgentsLLM(provider="modelscope")
-
-# 创建SimpleAgent
-agent = SimpleAgent(
-    name="AI助手",
-    llm=llm,
-    system_prompt="你是一个有用的AI助手"
-)
-
-# 开始对话
-response = agent.run("你好！请介绍一下自己")
-print(response)
-
-# 流式对话
-print("助手: ", end="", flush=True)
-for chunk in agent.stream_run("什么是人工智能？"):
-    print(chunk, end="", flush=True)
-print()
-
-# 检查自动检测结果
-print(f"自动检测的provider: {llm.provider}")
+```powershell
+Copy-Item config.example.yaml config.yaml
 ```
 
-## 🤖 Agent范式详解
+按本机情况修改 `config.yaml` 中的 `adb_path`、`hdc_path`、设备序列号和 `harmony_ability`。
 
-### 1. ReActAgent - 推理与行动结合
+## 翻译、打包和构建
 
-适用场景：需要外部信息、工具调用的任务
+在仓库根目录运行：
 
-```python
-from hello_agents import ReActAgent, ToolRegistry, search, calculate
-
-# 创建工具注册表
-tool_registry = ToolRegistry()
-tool_registry.register_function("search", "网页搜索工具", search)
-tool_registry.register_function("calculate", "数学计算工具", calculate)
-
-# 创建ReAct Agent
-react_agent = ReActAgent(
-    name="研究助手",
-    llm=llm,
-    tool_registry=tool_registry,
-    max_steps=5
-)
-
-# 执行需要工具的任务
-result = react_agent.run("搜索最新的GPT-4发展情况，并计算其参数量相比GPT-3的增长倍数")
+```powershell
+python main.py
 ```
 
-### 2. ReflectionAgent - 自我反思与迭代优化
+主流程会依次执行依赖分析、资源迁移、ArkTS 翻译、HarmonyOS 工程打包和 `assembleHap` 构建修复。输出工程位于 `HARMONY_WORK_BASE_DIR` 指定的目录。
 
-适用场景：代码生成、文档写作等需要迭代优化的任务
+常用命令：
 
-```python
-from hello_agents import ReflectionAgent
+```powershell
+# 限制构建修复轮数
+python main.py --max-fix-rounds 4 --max-builds 12
 
-# 创建Reflection Agent
-reflection_agent = ReflectionAgent(
-    name="代码专家",
-    llm=llm,
-    max_iterations=3
-)
+# 从已有 HarmonyOS 工程继续修复
+python main.py --resume E:\path\to\HarmonyProject
 
-# 生成并优化代码
-code = reflection_agent.run("编写一个高效的素数筛选算法，要求时间复杂度尽可能低")
-print(f"最终代码:\n{code}")
+# 查看运行状态
+python main.py --status E:\path\to\run-dir
 ```
 
-### 3. PlanAndSolveAgent - 分解规划与逐步执行
+构建成功后，`.hap` 通常位于输出工程的 `entry/build/default/outputs/default/`。配置签名后，可以用 DevEco Studio 打开输出工程并运行。
 
-适用场景：复杂多步骤问题、数学应用题、逻辑推理
+## 部署到鸿蒙设备
 
-```python
-from hello_agents import PlanAndSolveAgent
-
-# 创建Plan and Solve Agent
-plan_agent = PlanAndSolveAgent(name="问题解决专家", llm=llm)
-
-# 解决复杂问题
-problem = """
-一家公司第一年营收100万，第二年增长20%，第三年增长15%。
-如果每年的成本是营收的70%，请计算三年的总利润。
-"""
-answer = plan_agent.run(problem)
+```powershell
+hdc list targets
+hdc install -r E:\path\to\app.hap
 ```
 
-## 🛠️ 工具系统
+也可以用 DevEco Studio 打开输出工程，选择设备后点击运行。`bundleName` 和 `EntryAbility` 必须与工程配置一致。
 
-HelloAgents提供了完整的工具生态系统：
+## 差分测试
 
-### 内置工具
+差分测试包括录制、鸿蒙回放和评估：
 
-```python
-from hello_agents import ToolRegistry, SearchTool, CalculatorTool
+```powershell
+# Android 端录制轨迹
+python -m diff_tester record `
+  --pkg com.example.android `
+  --device <adb_serial> `
+  --traces 20 `
+  --out record_out `
+  --config config.yaml
 
-# 方式1：使用Tool对象（推荐）
-registry = ToolRegistry()
-registry.register_tool(SearchTool())
-registry.register_tool(CalculatorTool())
+# HarmonyOS 端回放
+python -m diff_tester replay `
+  --bundle com.example.harmony `
+  --device <hdc_serial> `
+  --hap E:\path\to\app.hap `
+  --traces record_out\traces `
+  --page-pairs page_pairs.json `
+  --out results `
+  --config config.yaml
 
-# 方式2：直接注册函数（简便）
-def my_tool(input_text: str) -> str:
-    return f"处理结果: {input_text}"
-
-registry.register_function("my_tool", "自定义工具描述", my_tool)
+# 生成指标和归因报告
+python -m diff_tester evaluate `
+  --results results `
+  --traces record_out\traces `
+  --bundle com.example.harmony `
+  --page-pairs page_pairs.json `
+  --out report `
+  --config config.yaml
 ```
 
-### 目前支持的工具
+构建完成后，也可以启用差分门禁：
 
-- **🔍 SearchTool**: 网页搜索（支持Tavily、SerpApi、模拟搜索）
-- **🧮 CalculatorTool**: 数学计算（支持复杂表达式和数学函数）
-- **🔧 自定义工具**: 支持任意Python函数注册为工具
-
-## ⚙️ 配置详解
-
-HelloAgents支持灵活的配置方式，**参数优先，环境变量兜底**：
-
-### 🎯 统一配置格式（推荐）
-
-编辑 `.env` 文件，配置你的API密钥。
-
-只需配置4个环境变量，框架自动检测provider：
-
-```env
-LLM_MODEL_ID=your-model-id
-LLM_API_KEY=ms-your_api_key_here
-LLM_BASE_URL=your-api-base-url
-LLM_TIMEOUT=60
+```powershell
+python main.py --enable-diff-gate --seeds-dir .diff_gate\seeds
 ```
 
-```python
-# 自动检测provider
-llm = HelloAgentsLLM()  # 框架自动检测为modelscope
-print(f"检测到的provider: {llm.provider}")
+## 测试
+
+离线单元测试不需要设备：
+
+```powershell
+python -m pytest -q
 ```
 
-> 💡 **智能检测**: 框架会根据API密钥格式和Base URL自动选择合适的provider
+## 目录说明
 
-### 支持的LLM提供商
+- `main.py`：翻译、打包和构建修复入口
+- `pipeline/`：翻译、资源迁移、工程打包和修复流程
+- `diff_tester/`：录制、回放、归一化、预言和评估
+- `HarmonyTemplate/`：HarmonyOS 工程模板
+- `tests/`：离线测试
+- `.env.example`、`config.example.yaml`：配置模板
 
-| 提供商 | 自动检测 | 专用环境变量 | 统一配置示例 |
-|--------|----------|-------------|-------------|
-| **ModelScope** | ✅ | `MODELSCOPE_API_KEY` | `LLM_API_KEY=ms-xxx...` |
-| **OpenAI** | ✅ | `OPENAI_API_KEY` | `LLM_API_KEY=sk-xxx...` |
-| **DeepSeek** | ✅ | `DEEPSEEK_API_KEY` | `LLM_BASE_URL=api.deepseek.com` |
-| **通义千问** | ✅ | `DASHSCOPE_API_KEY` | `LLM_BASE_URL=dashscope.aliyuncs.com` |
-| **月之暗面 Kimi** | ✅ | `KIMI_API_KEY` | `LLM_BASE_URL=api.moonshot.cn` |
-| **智谱AI GLM** | ✅ | `ZHIPU_API_KEY` | `LLM_BASE_URL=open.bigmodel.cn` |
-| **Ollama** | ✅ | `OLLAMA_API_KEY` | `LLM_BASE_URL=localhost:11434` |
-| **vLLM** | ✅ | `VLLM_API_KEY` | `LLM_BASE_URL=localhost:8000` |
-| **其他本地部署** | ✅ | - | `LLM_BASE_URL=localhost:PORT` |
-
-
-## 🎮 完整示例
-
-运行完整的交互式演示：
-
-```bash
-python examples/chapter07_basic_setup.py
-```
-
-这个示例包含：
-- ✅ 四种Agent范式的演示
-- ✅ 工具系统的使用
-- ✅ 交互式Agent选择
-- ✅ 流式响应体验
-
-## 🏗️ 项目结构
-
-```
-hello-agents/
-├── hello_agents/           # 主包
-│   ├── core/              # 核心组件
-│   │   ├── llm.py         # LLM抽象层
-│   │   ├── agent.py       # Agent基类
-│   │   └── ...
-│   ├── agents/            # Agent实现
-│   │   ├── simple.py      # SimpleAgent
-│   │   ├── react_agent.py # ReActAgent
-│   │   └── ...
-│   └── tools/             # 工具系统
-│       ├── registry.py    # 工具注册表
-│       └── builtin/       # 内置工具
-├── examples/              # 示例代码
-└── tests/                 # 测试用例
-```
-
-## 🤝 贡献
-
-欢迎贡献代码！请遵循以下步骤：
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
-
-## 📄 许可证
-
-本项目采用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
-
-**许可证要点**：
-- ✅ **署名** (Attribution): 使用时需要注明原作者
-- ✅ **相同方式共享** (ShareAlike): 修改后的作品需使用相同许可证
-- ⚠️ **非商业性使用** (NonCommercial): 不得用于商业目的
-
-如需商业使用，请联系项目维护者获取授权。
-
-## 🙏 致谢
-
-- 感谢 [Datawhale](https://github.com/datawhalechina) 提供的优秀开源教程
-- 感谢 [Hello-Agents 教程](https://github.com/datawhalechina/hello-agents) 的所有贡献者
-- 感谢所有为智能体技术发展做出贡献的研究者和开发者
-
-## 📚 文档资源
-
-### 📋 API文档
-- **[LLM接口](./docs/api/core/llm.md)** - 统一LLM接口
-- **[Agent系统](./docs/api/agents/index.md)** - 经典Agent范式
-- **[工具系统](./docs/api/tools/index.md)** - 工具注册和自定义开发
-
-### 📖 教程指南
-- **[配置指南](./docs/tutorials/CONFIGURATION.md)** - 详细的配置说明
-- **[本地部署指南](./docs/tutorials/LOCAL_DEPLOYMENT_GUIDE.md)** - Ollama、vLLM部署
-- **[Datawhale Hello-Agents 教程](https://github.com/datawhalechina/hello-agents)** - 原版教程
-
-### 示例代码
-
-- **[快速开始](./examples/chapter07_basic_setup.py)** - 立即体验
-
----
-
-<div align="center">
-
-**HelloAgents** - 让智能体开发变得简单而强大 🚀
-</div>
-
+离线测试通过不代表某个具体应用已经通过真实设备差分回放；设备、模型服务和签名配置依赖本机环境。
