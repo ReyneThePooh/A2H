@@ -13,7 +13,9 @@ from typing import Optional
 # 默认掩码正则（§6.1）：命中 → 替换为 "<VOLATILE>"
 # ---------------------------------------------------------------------------
 DEFAULT_MASK_PATTERNS: list[str] = [
-    r"\d{1,2}:\d{2}(:\d{2})?",                      # 时间 12:34 / 12:34:56
+    r"\d{1,2}:\d{2}(:\d{2})?(?:\s*(?i:[ap]m)\b)?", # 时间 12:34 / 12:34:56 PM
+    r"(?<![\w.])(?:0?[1-9]|1[0-2])\s+(?i:[ap]m)\b", # 小时+时段 7 AM
+    r"(?<=时间[：:])[0-5]?\d\s+(?i:[ap]m)\b",      # 旧录制中的“更新时间：40 PM”
     r"\d{4}[-/年]\d{1,2}[-/月](\d{1,2}日?)?",        # 日期 2026-09-04 / 2026年9月4日
     r"\d{1,2}[月/-]\d{1,2}日?",                      # 短日期 9/4、9月4日
     r"\d{6,}",                                       # 纯数字长串（验证码、订单号等）
@@ -55,6 +57,19 @@ class OracleConfig:
     widget_text_sim_min: float = 0.80  # L2 控件文本模糊匹配阈值（0~1）
     page_stem_sim_min: float = 0.75  # 页面名启发式匹配阈值（无映射表条目时）
     enable_l3: bool = True           # L3 视觉参考（仅记录，不判失败）
+    ignore_empty_placeholder_values: bool = True
+    # A value is treated as a placeholder only when it is also visible as a
+    # text/widget label.  Keep this list narrow; app-specific wording belongs
+    # in the project config rather than in the generic oracle.
+    placeholder_patterns: list[str] = field(default_factory=lambda: [
+        r"(?i)^(?:please\s+)?(?:enter|input|select|choose|search|query|type)\b.*$",
+        r"^(?:请输入|请填写|请选择|选择|搜索|查找|输入).+$",
+    ])
+    # Search fields commonly use ids such as cp_search_box while exposing a
+    # localized hint which has no reliable marker in a normalized StateVector.
+    placeholder_key_patterns: list[str] = field(default_factory=lambda: [
+        r"(?i)(?:search|query|keyword|placeholder|hint)",
+    ])
 
 
 @dataclass
@@ -69,6 +84,7 @@ class DeviceConfig:
     cmd_retries: int = 1             # 失败重试次数（验收要求：1 次）
     stable_timeout_s: float = 10.0   # 界面稳定判据超时（§4.6）
     stable_interval_s: float = 0.5   # 两次 dump 最小间隔
+    stable_samples: int = 3          # 连续一致的 dump 数，过滤短暂伪稳定帧
     launch_wait_s: float = 3.0       # 冷启动后固定等待
     harmony_ability: str = "EntryAbility"  # aa start 的 ability 名
 

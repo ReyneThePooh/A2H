@@ -1,21 +1,17 @@
-"""差分测试门禁 ↔ 翻译流水线桥接层（AI实现参考2 §3 集成契约的 A2H 侧）。
+"""翻译与差分门禁的桥接层。
 
-职责：
-1. 从 .pipeline_cache/translation_plan.json 推导 unit_page_map.json
-   （Unit → Android 页面 → Harmony 页面）；
-2. 按翻译器命名约定（XxxActivity → pages/XxxPage，见
-   unit_translator._guess_filename）生成 page_pairs.json；
-3. 定位构建产物 HAP、读取 bundleName，组装 GateRequest 调用 run_gate。
-
-方向约束（验收 §9 隔离性）：流水线 import 门禁（diff_tester.gate），
-门禁不 import 流水线内部模块，只消费 workspace 下的契约 JSON 文件。
+实际运行使用真实产物的页面映射，部署前验证构建输入和 HAP 哈希。
+旧工程可使用明确的映射文件；命名推导仅保留为独立兼容工具。
 """
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from pathlib import Path
 from typing import Iterator, Optional
+
+from run_control import atomic_write_json
 
 from diff_tester.gate import GateRequest, GateResult, run_gate
 
@@ -116,14 +112,132 @@ def build_page_pairs(
 
 def prepare_workspace(
     workspace: str | Path,
-    plan_path: str | Path,
+    plan_path: str | Path | None,
     ability: str = DEFAULT_ABILITY,
+    project_dir: str | Path | None = None,
 ) -> None:
-    """生成/刷新门禁 workspace 下的两份契约文件（G3：自动生成）。"""
+    """准备页面映射，不把应用结构正确当成运行差分测试的前提。
+
+    有清单时使用真实映射；无清单的旧工程要求已有明确映射。
+    已有映射与清单冲突时停止并保留文件，避免静默改变测试预期。
+    """
     workspace = Path(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
+    if project_dir is not None:
+        from pipeline.artifacts import load_artifact_manifest, project_path
+        root = Path(project_dir).resolve()
+        pairs_path, units_path = workspace / "page_pairs.json", workspace / "unit_page_map.json"
+        if not (root / "translation_manifest.json").is_file():
+            if not pairs_path.is_file() or not units_path.is_file():
+                raise RuntimeError("PAGE_MAPPING_MISSING: 旧工程需要真实产物清单，或已有 page_pairs.json 与 unit_page_map.json")
+            _validate_mappings(load_plan(pairs_path), load_plan(units_path), root)
+            return
+        manifest = load_artifact_manifest(root)
+        mapping = {u["name"]: {"android_pages": [], "harmony_pages": [],
+                              "unit_id": u["unit_id"]} for u in manifest["units"]}
+        by_id = {u["unit_id"]: u["name"] for u in manifest["units"]}
+        pairs = {}
+        for page in manifest["pages"]:
+            output = project_path(root, page["output"])
+            route_output = project_path(root, f"entry/src/main/ets/{page['route']}.ets")
+            if not output.is_file() or output != route_output or page["unit_id"] not in by_id:
+                raise RuntimeError(f"PAGE_MAPPING_INVALID: {page['android_activity']}")
+            android = page["android_activity"]
+            harmony = f"{ability}:{page['route']}"
+            for key in (android, android.rsplit(".", 1)[-1], "." + android.rsplit(".", 1)[-1]):
+                if key in pairs and pairs[key] != harmony:
+                    raise RuntimeError(f"AMBIGUOUS_PAGE_MAPPING: {key}")
+                pairs[key] = harmony
+            unit = mapping[by_id[page["unit_id"]]]
+            unit["android_pages"].append(android)
+            unit["harmony_pages"].append(harmony)
+        mapping["__global__"] = {"android_pages": ["*"], "harmony_pages": ["*"]}
+        _validate_mappings(pairs, mapping, root)
+        for path, expected in ((pairs_path, pairs), (units_path, mapping)):
+            if path.is_file() and load_plan(path) != expected:
+                raise RuntimeError(f"PAGE_MAPPING_CONFLICT: {path} 与清单不一致，已有映射已保留")
+        atomic_write_json(units_path, mapping)
+        atomic_write_json(pairs_path, pairs)
+        return
+    if plan_path is None:
+        raise RuntimeError("PAGE_MAPPING_MISSING: 缺少工程或翻译计划")
     build_unit_page_map(plan_path, workspace / "unit_page_map.json", ability)
     build_page_pairs(plan_path, workspace / "page_pairs.json", ability)
+
+
+def prepare_static_index(
+    project_dir: str | Path,
+    workspace: str | Path,
+    seeds_dir: str | Path | None = None,
+) -> tuple[object, list[dict]]:
+    """Index ArkTS sources and validate replay-facing static contracts.
+
+    The index is persisted beside the gate evidence so repair and diagnostic
+    tools can cite exact source locations.  Static issues are reported before
+    device deployment; a missing action id or dangling literal route is a
+    deterministic translation contract failure and must not be converted into
+    a runtime replay failure.
+    """
+    from analyzers.arkts_index import (
+        build_arkts_index, save_arkts_index, validate_static_contract,
+    )
+
+    root = Path(project_dir).resolve()
+    work = Path(workspace).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    index = build_arkts_index(root)
+    save_arkts_index(index, work / "arkts_index.json")
+
+    traces: list[dict] = []
+    if seeds_dir:
+        seed_root = Path(seeds_dir)
+        for path in sorted(seed_root.glob("*.json"), key=lambda item: item.name.casefold()):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                # Trace schema validation remains the gate's source of truth;
+                # malformed seeds must not be silently treated as static pass.
+                continue
+            if isinstance(payload, dict):
+                traces.append(payload)
+    pairs: dict = {}
+    pairs_path = work / "page_pairs.json"
+    if pairs_path.is_file():
+        try:
+            loaded = json.loads(pairs_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                pairs = loaded
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    issues = validate_static_contract(index, pairs, traces)
+    atomic_write_json(work / "arkts_static_issues.json", {"issues": issues})
+    if issues:
+        preview = json.dumps(issues[:8], ensure_ascii=False, separators=(",", ":"))
+        raise RuntimeError(
+            f"STATIC_CONTRACT_INVALID: {len(issues)} issue(s); see "
+            f"{work / 'arkts_static_issues.json'}; preview={preview}"
+        )
+    return index, issues
+
+
+def _validate_mappings(pairs: dict, mapping: dict, root: Path) -> None:
+    from pipeline.artifacts import project_path
+    if not isinstance(pairs, dict) or not pairs or not isinstance(mapping, dict) or not mapping:
+        raise RuntimeError("PAGE_MAPPING_INVALID: 页面与单元映射必须为非空对象")
+    for android, harmony in pairs.items():
+        if not isinstance(android, str) or not android or not isinstance(harmony, str):
+            raise RuntimeError("PAGE_MAPPING_INVALID: 页面映射必须为非空字符串")
+        ability, separator, route = harmony.partition(":")
+        if (not ability or not separator or not route
+                or not project_path(root, f"entry/src/main/ets/{route}.ets").is_file()):
+            raise RuntimeError(f"PAGE_MAPPING_INVALID: {android} -> {harmony}")
+    for unit in mapping.values():
+        if not isinstance(unit, dict) or any(
+            not isinstance(unit.get(key), list)
+            or any(not isinstance(page, str) for page in unit[key])
+            for key in ("android_pages", "harmony_pages")
+        ):
+            raise RuntimeError("PAGE_MAPPING_INVALID: 单元映射需要页面列表")
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +265,7 @@ def find_hap(project_dir: str | Path) -> Optional[Path]:
                   key=lambda p: p.stat().st_mtime, reverse=True)
     if not haps:
         return None
-    signed = [p for p in haps if "signed" in p.name.lower()]
+    signed = [p for p in haps if p.name.lower().endswith("-signed.hap")]
     return signed[0] if signed else haps[0]
 
 
@@ -165,7 +279,16 @@ def unit_ets_files(
     命名约定同 unit_translator._guess_filename：
     XxxActivity.java → XxxPage.ets；其他 Java 文件 → 同名 .ets。
     """
-    pages_dir = Path(project_dir) / PAGES_REL
+    root = Path(project_dir)
+    if (root / "translation_manifest.json").exists():
+        from pipeline.artifacts import load_artifact_manifest
+        manifest = load_artifact_manifest(root)
+        selected = {u["unit_id"] for u in manifest["units"]
+                    if u["name"] in unit_names or u["unit_id"] in unit_names}
+        return [root / out["path"] for out in manifest["outputs"]
+                if out["unit_id"] in selected and (root / out["path"]).is_file()
+                and out["path"].endswith(".ets")]
+    pages_dir = root / PAGES_REL
     wanted = set(unit_names)
     files: list[Path] = []
     for unit in plan.get("units", []):
@@ -197,7 +320,10 @@ def run_diff_gate(
     bundle: Optional[str] = None,
     full_replay: bool = False,
     install: bool = True,
-    time_budget_s: float = 300.0,
+    time_budget_s: Optional[float] = None,
+    confirm_failures: bool = True,
+    trace_ids: Optional[list[str]] = None,
+    static_preflight: bool = True,
 ) -> GateResult:
     """组装 GateRequest 并执行一轮门禁。
 
@@ -213,10 +339,36 @@ def run_diff_gate(
             "请用 --bundle 显式指定"
         )
     hap: Optional[Path] = None
+    deployment = {}
     if install:
-        hap = find_hap(project_dir)
-        if hap is None:
-            raise RuntimeError(f"未在 {project_dir} 下找到 .hap 构建产物，请先构建")
+        metadata_path = project_dir / ".pipeline_build.json"
+        if not metadata_path.exists():
+            raise RuntimeError("BUILD_PROVENANCE_MISSING: rebuild before replay")
+        deployment = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if deployment.get("status") != "success":
+            raise RuntimeError("BUILD_NOT_VERIFIED: latest build did not pass")
+        from pipeline.artifacts import project_source_fingerprint
+        if deployment.get("project_input_sha256") != project_source_fingerprint(project_dir):
+            raise RuntimeError("STALE_BUILD: project changed since the recorded build")
+        artifacts = deployment.get("artifacts", [])
+        artifacts = sorted(artifacts, key=lambda x: not bool(x.get("signed")))
+        if not artifacts:
+            raise RuntimeError("BUILD_ARTIFACT_MISSING: no verified HAP")
+        artifact = artifacts[0]
+        hap = (project_dir / artifact["path"]).resolve()
+        if not hap.is_relative_to(project_dir.resolve()) or not hap.is_file():
+            raise RuntimeError("BUILD_ARTIFACT_MISSING: invalid HAP path")
+        if hashlib.sha256(hap.read_bytes()).hexdigest() != artifact["sha256"]:
+            raise RuntimeError("STALE_BUILD: HAP digest mismatch")
+        deployment = {**deployment, "selected_artifact": artifact}
+
+    if static_preflight:
+        effective_seeds = seeds_dir or (Path(workspace) / "seeds")
+        prepare_static_index(
+            project_dir,
+            workspace,
+            effective_seeds if Path(effective_seeds).is_dir() else None,
+        )
 
     return run_gate(GateRequest(
         bundle=bundle,
@@ -228,4 +380,7 @@ def run_diff_gate(
         full_replay=full_replay,
         seeds_dir=seeds_dir,
         time_budget_s=time_budget_s,
+        deployment_metadata=deployment,
+        confirm_failures=confirm_failures,
+        trace_ids=list(trace_ids or []),
     ))

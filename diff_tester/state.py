@@ -4,6 +4,7 @@
 `alpha(adapter, ...)` 是面向设备的封装：dump + 截图 + 崩溃轮询 + 落盘附件。
 """
 from __future__ import annotations
+from run_control import BudgetExceeded
 
 import math
 import os
@@ -13,7 +14,8 @@ from typing import TYPE_CHECKING, Optional
 
 from .config import DEFAULT_MASK_PATTERNS
 from .matcher import _subtree_text
-from .schemas import StateVector, UNode
+from .schemas import (ACTIVE_SCOPE_ID, StateVector, UNode,
+                      semantic_widget_role)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .adapters.base import DeviceAdapter
@@ -32,6 +34,32 @@ _CHROME_TEXT = re.compile(
 )
 _VOLATILE_ONLY = re.compile(rf"^(?:{re.escape(VOLATILE)}(?:\s*[AP]M)?\s*)+$", re.IGNORECASE)
 
+# These markers commonly belong to the OpenHarmony system photo picker. Only
+# the stable platform root below confirms ownership; labels create an
+# unconfirmed observation and remain part of application semantics.
+_PHOTO_PICKER_MARKERS = frozenset({
+    "所有图片",
+    "所有相册",
+    "安全访问图库",
+    "仅可访问所选图片",
+    "拍照",
+})
+_PHOTO_PICKER_ROOT_IDS = frozenset({"photo_grid_base"})
+UNCONFIRMED_EXTERNAL_SURFACE = "unconfirmed"
+
+
+def _matches_platform_root_id(node_id: Optional[str], roots: frozenset[str]) -> bool:
+    """Match a stable resource ID in bare, namespaced, or path-qualified form."""
+    if not node_id:
+        return False
+    normalized = node_id.strip().replace("\\", "/").rstrip("/")
+    return any(
+        normalized == root
+        or normalized.endswith(f"/{root}")
+        or normalized.endswith(f":{root}")
+        for root in roots
+    )
+
 
 def compile_masks(patterns: Optional[list[str]] = None) -> list[re.Pattern]:
     return [re.compile(p) for p in (patterns if patterns is not None else DEFAULT_MASK_PATTERNS)]
@@ -42,6 +70,81 @@ def mask_text(s: str, compiled: list[re.Pattern]) -> str:
     for p in compiled:
         s = p.sub(VOLATILE, s)
     return s.strip()
+
+
+def canonical_text(s: str, compiled: list[re.Pattern]) -> str:
+    """Apply volatility masks and drop labels made entirely of volatile data."""
+    masked = mask_text(s, compiled)
+    return "" if _VOLATILE_ONLY.fullmatch(masked) else masked
+
+
+def _semantic_widget_role(node: UNode) -> Optional[str]:
+    """Map platform rendering roles to their user-facing interaction role."""
+    role = semantic_widget_role(node.role, node.clickable)
+    return role if role in _WIDGET_ROLES else None
+
+
+def _active_scope(tree: UNode) -> UNode:
+    scopes = tree.find_all(lambda node: node.id == ACTIVE_SCOPE_ID)
+    if not scopes:
+        return tree
+    # Nested builders may expose the marker more than once. The smallest
+    # marked subtree is the effective interaction surface shown to the user.
+    return min(scopes, key=lambda node: node.rel_area())
+
+
+def _external_surface_partition(tree: UNode) -> tuple[Optional[str], set[int]]:
+    """Identify a known system surface and the nodes owned by that surface."""
+    def markers_below(root: UNode) -> set[str]:
+        matched: set[str] = set()
+        for node in root.iter_all():
+            labels = (node.text.strip(), node.desc.strip())
+            for marker in _PHOTO_PICKER_MARKERS:
+                if any(label and marker in label for label in labels):
+                    matched.add(marker)
+        return matched
+
+    # A stable platform root establishes ownership. Localized labels only help
+    # choose between duplicate roots and are never sufficient on their own.
+    candidates = [
+        (node, len(markers_below(node)))
+        for node in tree.iter_all()
+        if _matches_platform_root_id(node.id, _PHOTO_PICKER_ROOT_IDS)
+    ]
+    if not candidates:
+        marker_count = len(markers_below(tree))
+        if marker_count >= 2:
+            # Keep all nodes in application semantics: labels alone cannot
+            # prove system ownership. The sentinel only prevents this
+            # ambiguous observation from being routed to automatic repair.
+            return UNCONFIRMED_EXTERNAL_SURFACE, set()
+        return None, set()
+    surface_root = min(candidates, key=lambda item: (-item[1], item[0].rel_area()))[0]
+
+    def path_to(node: UNode, target: UNode) -> Optional[list[UNode]]:
+        if node is target:
+            return [node]
+        for child in node.children:
+            child_path = path_to(child, target)
+            if child_path is not None:
+                return [node, *child_path]
+        return None
+
+    surface_path = path_to(tree, surface_root) or [surface_root]
+    # Some dumps wrap the stable platform root in a single anonymous list or
+    # modal node. Include only an unambiguous one-child wrapper; broader
+    # ownership would risk hiding application siblings from L2 comparison.
+    for ancestor in reversed(surface_path[1:-1]):
+        if (len(ancestor.children) == 1
+                and ancestor.id is None
+                and not ancestor.text.strip()
+                and not ancestor.desc.strip()):
+            surface_root = ancestor
+        else:
+            break
+
+    excluded = {id(node) for node in surface_root.iter_all()}
+    return "photo_picker", excluded
 
 
 def build_state_vector(
@@ -55,6 +158,8 @@ def build_state_vector(
     dump_path: str = "",
 ) -> StateVector:
     """UNode 树 + 页面名 → 语义状态向量（纯函数）。"""
+    external_surface, external_nodes = _external_surface_partition(tree)
+    tree = _active_scope(tree)
     texts: Counter[str] = Counter()
     widgets: dict[str, list[str]] = {}
     values: dict[str, str] = {}
@@ -62,15 +167,17 @@ def build_state_vector(
     role_seq: Counter[str] = Counter()   # 各 role 的序号计数（无 id 时用作 key）
 
     for n in tree.iter_all():
+        if id(n) in external_nodes:
+            continue
         if _is_system_chrome(n):
             continue
         if n.text:
-            t = mask_text(n.text, masks)
-            if t and not _VOLATILE_ONLY.match(t):
+            t = canonical_text(n.text, masks)
+            if t:
                 texts[t] += 1
         if n.desc:
-            t = mask_text(n.desc, masks)
-            if t and not _VOLATILE_ONLY.match(t):
+            t = canonical_text(n.desc, masks)
+            if t:
                 texts[t] += 1
 
         idx = role_seq[n.role]
@@ -85,10 +192,13 @@ def build_state_vector(
             list_counts[key] = len(n.children)
 
     for n in tree.iter_interactive():
-        if n.role in _WIDGET_ROLES:
+        if id(n) in external_nodes:
+            continue
+        semantic_role = _semantic_widget_role(n)
+        if semantic_role is not None:
             # 子树文本兜底：ArkTS Button(){Text()} 结构文本挂在子节点上
             label = mask_text(n.text or n.desc or _subtree_text(n), masks)
-            widgets.setdefault(n.role, []).append(label)
+            widgets.setdefault(semantic_role, []).append(label)
     for r in widgets:
         widgets[r].sort()
 
@@ -104,6 +214,7 @@ def build_state_vector(
         crash_sig=crash_sig,
         screenshot=screenshot,
         dump_path=dump_path,
+        external_surface=external_surface,
     )
 
 
@@ -135,6 +246,8 @@ def alpha(
         screenshot_path = os.path.join(artifacts_dir, f"{tag}.png")
         try:
             adapter.screenshot(screenshot_path)
+        except BudgetExceeded:
+            raise
         except Exception:   # 截图失败不阻断状态抽象（只是附件）
             screenshot_path = ""
         dump_path = os.path.join(artifacts_dir, f"{tag}_dump.json")

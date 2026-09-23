@@ -1,7 +1,7 @@
 """FLAKY（不稳定轨迹）观察名单管理（AI实现参考2 §5）。
 
-分叉但复跑不复现 → 本轮放行、记一次 FLAKY；连续 ESCALATE_AFTER 轮
-FLAKY → 升级为失败。轨迹通过时清零计数。
+分叉但复跑不复现 → 本轮 INCONCLUSIVE、记一次 FLAKY；连续
+ESCALATE_AFTER 轮仍不稳定则升级观察提示，始终不当作可靠通过。
 
 状态持久化在 workspace/flaky.json，跨门禁轮次保留。
 """

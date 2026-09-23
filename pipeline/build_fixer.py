@@ -7,6 +7,8 @@
 - remaining_errors_count 由最终错误列表直接计算，不依赖调用方传入
 """
 
+import contextlib
+import json
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -20,6 +22,8 @@ from pipeline.project_packager import (
     run_hvigor,
 )
 from pipeline.agents import create_pipeline_llm
+from pipeline.artifacts import content_hash, project_path, updated_artifact_manifest
+from pipeline.file_transaction import FileBatchTransaction, recover_file_transactions
 
 
 # ============================================================
@@ -180,9 +184,13 @@ INITIAL_PROMPT = """以下ArkTS文件编译失败，请修复所有错误。
 {source_code}
 ```
 
+相关本地依赖（只读，用于核对真实接口签名）:
+{dependency_context}
+
 要求:
 - 只修复错误，不改动无关部分，保留业务逻辑
 - 严格遵循ArkTS规范（禁止any/unknown、禁止构造函数类型、禁止对象字面量缺类型等）
+- 禁止用 as never 或无关类型的强制断言绕过类型检查；必须按依赖的真实接口修复
 - 返回修复后的完整文件，用```typescript包裹
 """
 
@@ -210,6 +218,9 @@ REFINE_PROMPT = """请根据审查意见改进代码。
 {last_attempt}
 ```
 
+相关本地依赖（只读，用于核对真实接口签名）:
+{dependency_context}
+
 审查意见:
 {feedback}
 
@@ -221,17 +232,148 @@ REFINE_PROMPT = """请根据审查意见改进代码。
 # 修复循环
 # ============================================================
 
+def behavior_guard(source: str, fixed: str) -> str | None:
+    """Conservative signals, not a proof of semantic equivalence.
+
+    Reject newly introduced empty/log-only methods; existing legitimate empty
+    lifecycle hooks are unchanged and do not trigger this check.
+    """
+    pattern = re.compile(
+        r"\b(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^{}]*\)\s*"
+        r"(?::\s*[^{}=;]+)?\s*\{([^{}]*)\}", re.MULTILINE)
+
+    def stubs(code: str) -> set[str]:
+        found = set()
+        from pipeline.artifacts import code_without_comments
+        code = code_without_comments(code)
+        for m in pattern.finditer(code):
+            name, body = m.groups()
+            if name in {"if", "for", "while", "switch", "catch", "constructor"}:
+                continue
+            body = body.strip()
+            if (not body or body == "return;"
+                    or re.fullmatch(r"(?:console\.\w+\([^;]*\);?\s*)+", body)):
+                found.add(name)
+        return found
+
+    introduced = stubs(fixed) - stubs(source)
+    if introduced:
+        return "BEHAVIOR_REMOVED: empty/log-only methods: " + ", ".join(sorted(introduced))
+    # An existing event binding disappearing is a diagnostic refusal rather
+    # than an opportunity to erase the interaction to pass compilation.
+    for marker in ("onClick", "onChange", "onAction"):
+        binding = rf"\.{marker}\s*\("
+        if len(re.findall(binding, source)) > len(re.findall(binding, fixed)):
+            return "BEHAVIOR_REMOVED: " + marker + " bindings removed"
+    return None
+
+
 class BuildFixLoop:
     """构建-修复-再验证闭环"""
 
     def __init__(self, llm: Optional[HelloAgentsLLM] = None,
-                 max_fix_rounds: int = 3, reflect_rounds: int = 2):
-        self.llm = llm or create_pipeline_llm()
+                 max_fix_rounds: int = 4, reflect_rounds: int = 2):
+        self.llm = llm
         self.max_fix_rounds = max_fix_rounds
         self.reflect_rounds = reflect_rounds
 
     def run(self, project_dir: str | Path,
-            sync_dir: str | Path | None = None) -> dict[str, Any]:
+            sync_dir: str | Path | None = None, *,
+            workspace: str | Path | None = None,
+            _project_lock_held: bool = False) -> dict[str, Any]:
+        """直接修复指定工程；中断或达到上限后保留当前代码供续跑。"""
+        from run_control import FileLock, atomic_json, check_budget
+        project_dir = Path(project_dir).resolve()
+        sync_root = Path(sync_dir).resolve() if sync_dir else None
+        if sync_root == project_dir:
+            sync_root = None
+        transaction_roots = [project_dir]
+        if sync_root is not None:
+            transaction_roots.append(sync_root)
+        transaction_dir = (
+            Path(workspace).resolve() / "build_transactions"
+            if workspace is not None
+            else project_dir / ".pipeline_transactions" / "build"
+        )
+        self._transaction_dir = transaction_dir
+        self._transaction_roots = transaction_roots
+        lock = (
+            contextlib.nullcontext()
+            if _project_lock_held
+            else FileLock(project_dir.parent / f".{project_dir.name}.repair.lock")
+        )
+        with lock:
+            recover_file_transactions(
+                transaction_dir,
+                owner="build_repair",
+                roots=transaction_roots,
+                keep_committed=lambda _transaction_id: True,
+            )
+            check_budget()
+            result = self._run_in_place(project_dir, sync_dir=sync_root)
+            self._refresh_manifests(project_dir, sync_root)
+            result["status"] = "BUILD_VERIFIED" if result["success"] else "BUILD_FAILED"
+            if not result["success"]:
+                proof_path = project_dir / ".pipeline_build.json"
+                try:
+                    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    proof = None
+                if isinstance(proof, dict) and proof.get("status") == "success":
+                    proof.update(
+                        status="failed",
+                        stop_reason=result.get(
+                            "stop_reason", "BUILD_VALIDATION_FAILED"
+                        ),
+                    )
+                    atomic_json(proof_path, proof)
+            if workspace is not None:
+                atomic_json(Path(workspace) / "build_result.json", result)
+            return result
+
+    def _refresh_manifests(self, project_dir: Path,
+                           sync_root: Optional[Path]) -> None:
+        """Refresh both manifests in one recoverable transaction."""
+        writes = {}
+        preconditions = {}
+        for root in (project_dir, sync_root):
+            if root is None:
+                continue
+            manifest_path = root / "translation_manifest.json"
+            if not manifest_path.is_file():
+                continue
+            manifest_before = manifest_path.read_bytes()
+            manifest = updated_artifact_manifest(root, {})
+            preconditions[manifest_path] = content_hash(manifest_before)
+            preconditions.update(self._manifest_preconditions(root, manifest, {}))
+            writes[manifest_path] = json.dumps(
+                manifest, ensure_ascii=False, indent=2, sort_keys=True
+            ).encode("utf-8")
+        if not writes:
+            return
+        transaction = FileBatchTransaction(
+            journal_dir=self._transaction_dir,
+            owner="build_repair",
+            roots=self._transaction_roots,
+            writes=writes,
+            preconditions=preconditions,
+        )
+        transaction.commit()
+        transaction.finalize()
+
+    @staticmethod
+    def _manifest_preconditions(project_dir: Path, manifest: dict,
+                                replacements: dict[Path, bytes]) -> dict[Path, str | None]:
+        replaced = {Path(path).resolve() for path in replacements}
+        return {
+            path: output["sha256"]
+            for output in manifest.get("outputs", [])
+            for path in [project_path(project_dir, output["path"])]
+            if path not in replaced
+        }
+
+    def _run_in_place(self, project_dir: str | Path,
+                      sync_dir: str | Path | None = None) -> dict[str, Any]:
         """对 project_dir 反复构建并修复，直到通过或达到最大修复轮数。
 
         Args:
@@ -283,6 +425,10 @@ class BuildFixLoop:
 
         # 共 max_fix_rounds 轮修复，每轮前后都有构建：最后一次构建仅做验证
         for round_no in range(self.max_fix_rounds + 1):
+            from run_control import atomic_write, check_budget
+            check_budget()
+            validation_marker = project_dir / ".pipeline_build_validation_pending"
+            atomic_write(validation_marker, b"post-build validation pending\n")
             result = run_hvigor(project_dir)
             builds += 1
             errors = ErrorParser.parse(result.stdout, result.stderr)
@@ -293,6 +439,7 @@ class BuildFixLoop:
                 # （new @Component 编译不报错，但启动即 TypeError 闪退）
                 violations = find_component_new_violations(project_dir)
                 if not violations:
+                    validation_marker.unlink(missing_ok=True)
                     print(f"\n✅ 构建通过（第 {builds} 次构建）")
                     return self._result(True, builds, initial_count or 0, [])
                 errors = [{
@@ -309,6 +456,9 @@ class BuildFixLoop:
                     ),
                     "code": "ARKUI_NEW_COMPONENT",
                 } for v in violations]
+                self._invalidate_build_proof(
+                    project_dir, "ARKUI_STATIC_VALIDATION_FAILED"
+                )
                 print(f"\n❌ 构建通过，但 ArkUI 静态检查发现 "
                       f"{len(errors)} 处 new @Component 违规")
 
@@ -330,11 +480,31 @@ class BuildFixLoop:
                 break
 
             print(f"\n🤖 第 {round_no + 1}/{self.max_fix_rounds} 轮反思修复...")
+            sources = project_dir / "entry/src/main/ets"
+            before = {str(p): p.read_bytes() for p in sources.rglob("*.ets")}
             self._fix_files(project_dir, sync_dir, errors)
+            after = {str(p): p.read_bytes() for p in sources.rglob("*.ets")}
+            if before == after:
+                stopped = self._result(False, builds, initial_count or 0, errors)
+                stopped["stop_reason"] = "NO_PROGRESS"
+                return stopped
 
         return self._result(False, builds, initial_count or 0, errors)
 
     # ---- 单轮修复 ----
+
+    @staticmethod
+    def _invalidate_build_proof(project_dir: Path, reason: str) -> None:
+        from run_control import atomic_json
+
+        proof_path = project_dir / ".pipeline_build.json"
+        try:
+            proof = json.loads(proof_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(proof, dict) and proof.get("status") == "success":
+            proof.update(status="failed", stop_reason=reason)
+            atomic_json(proof_path, proof)
 
     # catch 子句类型标注（arkts-no-types-in-catch）是纯语法问题，直接正则移除，
     # 不进 LLM。注意保留 Promise .catch((e: T) => ...) 回调参数标注（合法写法）。
@@ -365,6 +535,7 @@ class BuildFixLoop:
 
     def _fix_files(self, project_dir: Path, sync_dir: Optional[Path],
                    errors: list[dict]):
+        from run_control import atomic_write
         by_file: dict[Path, list[dict]] = {}
         for err in errors:
             fp = self._locate(project_dir, err["file"])
@@ -377,7 +548,8 @@ class BuildFixLoop:
             rel = fp.relative_to(project_dir)
             print(f"\n  📄 {rel} ({len(file_errors)} 个错误)")
             try:
-                source = fp.read_text(encoding="utf-8")
+                original = fp.read_bytes()
+                source = original.decode("utf-8")
             except Exception as e:
                 print(f"    ❌ 读取失败: {e}")
                 continue
@@ -393,8 +565,10 @@ class BuildFixLoop:
                 do_reflect = len(llm_errors) <= 5
                 if not do_reflect:
                     print(f"    → 错误较多，本轮只做一次修复、跳过审查")
+                dependency_context = self._local_dependency_context(fp, project_dir)
                 llm_fixed = self._reflection_fix(
-                    str(rel), base, llm_errors, do_reflect=do_reflect)
+                    str(rel), base, llm_errors,
+                    dependency_context=dependency_context, do_reflect=do_reflect)
                 if llm_fixed:
                     fixed = llm_fixed
 
@@ -407,20 +581,80 @@ class BuildFixLoop:
                 print(f"    ⚠️ 修复结果校验不通过，已丢弃: {reject_reason}")
                 continue
 
-            backup = fp.with_suffix(fp.suffix + ".bak")
-            if not backup.exists():
-                backup.write_text(source, encoding="utf-8")
-            fp.write_text(fixed, encoding="utf-8")
-            print("    ✅ 已写入修复")
+            if fp.read_bytes() != original:
+                raise RuntimeError(
+                    f"Build repair source changed while proposal was generated: {fp}"
+                )
 
-            if sync_dir:
-                sync_target = sync_dir / rel
-                if sync_target.exists():
-                    sync_target.write_text(fixed, encoding="utf-8")
-                    print(f"    ↩ 已同步回生成工程: {sync_target}")
+            replacement = fixed.encode("utf-8")
+            backup = fp.with_suffix(fp.suffix + ".bak")
+            writes = {fp: replacement}
+            if not backup.exists():
+                writes[backup] = original
+            preconditions = {fp: content_hash(original)}
+
+            sync_root = sync_dir.resolve() if sync_dir else None
+            sync_target = None
+            if sync_root is not None:
+                candidate = (sync_root / rel).resolve()
+                if candidate.is_file() and candidate.is_relative_to(sync_root):
+                    sync_target = candidate
+                    sync_original = sync_target.read_bytes()
+                    writes[sync_target] = replacement
+                    preconditions[sync_target] = content_hash(sync_original)
+
+            manifest_path = project_dir / "translation_manifest.json"
+            if manifest_path.is_file():
+                manifest_before = manifest_path.read_bytes()
+                manifest = updated_artifact_manifest(
+                    project_dir, {fp: replacement}
+                )
+                preconditions[manifest_path] = content_hash(manifest_before)
+                preconditions.update(self._manifest_preconditions(
+                    project_dir, manifest, {fp: replacement}
+                ))
+                writes[manifest_path] = json.dumps(
+                    manifest, ensure_ascii=False, indent=2, sort_keys=True
+                ).encode("utf-8")
+            if sync_root is not None and sync_target is not None:
+                sync_manifest = sync_root / "translation_manifest.json"
+                if sync_manifest.is_file():
+                    sync_manifest_before = sync_manifest.read_bytes()
+                    manifest = updated_artifact_manifest(
+                        sync_root, {sync_target: replacement}
+                    )
+                    preconditions[sync_manifest] = content_hash(
+                        sync_manifest_before
+                    )
+                    preconditions.update(self._manifest_preconditions(
+                        sync_root, manifest, {sync_target: replacement}
+                    ))
+                    writes[sync_manifest] = json.dumps(
+                        manifest, ensure_ascii=False, indent=2, sort_keys=True
+                    ).encode("utf-8")
+
+            roots = getattr(self, "_transaction_roots", None)
+            if roots is None:
+                roots = [project_dir.resolve()]
+                if sync_root is not None:
+                    roots.append(sync_root)
+            transaction = FileBatchTransaction(
+                journal_dir=getattr(self, "_transaction_dir", None),
+                owner="build_repair",
+                roots=roots,
+                writes=writes,
+                preconditions=preconditions,
+                writer=atomic_write,
+            )
+            transaction.commit()
+            transaction.finalize()
+            print("    ✅ 已写入修复")
+            if sync_target is not None:
+                print(f"    ↩ 已同步回生成工程: {sync_target}")
 
     def _reflection_fix(self, file_path: str, source: str,
-                        errors: list[dict], do_reflect: bool = True) -> Optional[str]:
+                        errors: list[dict], dependency_context: str = "无",
+                        do_reflect: bool = True) -> Optional[str]:
         """单文件反思修复：修复 → 审查 → （必要时）改进。真正的验证靠外层重新构建。"""
         errors_text = self._format_errors(errors)
         current = None
@@ -430,10 +664,12 @@ class BuildFixLoop:
         for i in range(rounds):
             if i == 0:
                 prompt = INITIAL_PROMPT.format(
-                    file_path=file_path, errors=errors_text, source_code=source)
+                    file_path=file_path, errors=errors_text, source_code=source,
+                    dependency_context=dependency_context)
             else:
                 prompt = REFINE_PROMPT.format(
-                    errors=errors_text, last_attempt=current, feedback=feedback)
+                    errors=errors_text, last_attempt=current, feedback=feedback,
+                    dependency_context=dependency_context)
 
             response = self._invoke(prompt)
             fixed = self._extract_code(response)
@@ -453,6 +689,34 @@ class BuildFixLoop:
         return current
 
     @staticmethod
+    def _local_dependency_context(source_path: Path, project_dir: Path,
+                                  max_files: int = 4, max_chars: int = 40_000) -> str:
+        """Read bounded relative-import dependencies for interface evidence."""
+        try:
+            source = source_path.read_text(encoding="utf-8")
+        except OSError:
+            return "无"
+        blocks = []
+        used = 0
+        for spec in re.findall(r"from\s+['\"](\.[^'\"]+)['\"]", source):
+            candidate = (source_path.parent / spec).with_suffix(".ets").resolve()
+            if (not candidate.is_relative_to(project_dir.resolve()) or not candidate.is_file()
+                    or len(blocks) >= max_files):
+                continue
+            try:
+                content = candidate.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            content = content[:remaining]
+            relative = candidate.relative_to(project_dir).as_posix()
+            blocks.append(f"\n### {relative}\n```typescript\n{content}\n```")
+            used += len(content)
+        return "\n".join(blocks) if blocks else "无"
+
+    @staticmethod
     def _validate_fixed(source: str, fixed: str) -> Optional[str]:
         """LLM 修复结果的合法性检查，返回拒绝原因；通过时返回 None。
 
@@ -469,6 +733,8 @@ class BuildFixLoop:
                     "interface", "enum", "@Entry", "@Component")
         if not any(kw in fixed for kw in keywords):
             return "不含任何 ArkTS 结构关键字"
+        if reason := behavior_guard(source, fixed):
+            return reason
         return None
 
     # ---- 辅助 ----
@@ -490,27 +756,34 @@ class BuildFixLoop:
             {"role": "user", "content": prompt},
         ]
         try:
+            if self.llm is None:
+                self.llm = create_pipeline_llm()
             return self.llm.invoke(messages) or ""
         except Exception as e:
+            from run_control import BudgetExceeded
+            from pipeline.agents import LLMCallError
+            if isinstance(e, (BudgetExceeded, LLMCallError)):
+                raise
             print(f"    ⚠️ LLM调用失败: {e}")
             return ""
 
     @staticmethod
     def _locate(project_dir: Path, file_path: str) -> Optional[Path]:
         """把错误信息里的路径定位到 project_dir 内的真实文件"""
+        project_dir = project_dir.resolve()
         p = Path(str(file_path).replace("\\", "/"))
-        if p.is_absolute() and p.exists():
-            try:
-                p.relative_to(project_dir)
-                return p
-            except ValueError:
-                return None
-        candidate = project_dir / p
-        return candidate if candidate.exists() else None
+        candidate = (project_dir / p).resolve()
+        allowed = project_dir / "entry/src/main/ets"
+        return (candidate if candidate.is_relative_to(allowed) and candidate.is_file()
+                and candidate.suffix == ".ets" else None)
 
     @staticmethod
     def _extract_code(response: str) -> Optional[str]:
-        m = re.search(r"```(?:typescript|ts|ets)?\s*\n(.*?)```", response, re.DOTALL)
+        m = re.search(
+            r"```(?:typescript|ts|ets)?[ \t]*\r?\n(.*?)```",
+            response,
+            re.DOTALL,
+        )
         return m.group(1).strip() if m else None
 
     @staticmethod

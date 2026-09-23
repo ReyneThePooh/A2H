@@ -14,7 +14,7 @@ from pipeline.static_graph import (
     norm_path, ProjectIndex, build_file_graph, build_hard_groups,
     tarjan_scc, layered_topological_sort, validate_plan,
 )
-from pipeline.order_determiner import Unit, UnitBuilder, UnitDependencyAnalyzer, topological_sort
+from pipeline.order_determiner import Unit, UnitBuilder, UnitDependencyAnalyzer, topological_sort, merge_cyclic_units
 
 
 # ============================================================
@@ -265,6 +265,20 @@ def test_topological_sort_units():
     assert cycles == []
     assert {u.name for u in layers[0]} == {"A", "B"}
     assert [u.name for u in layers[1]] == ["C"]
+
+
+def test_merge_cycle_preserves_sources_external_edges_and_is_idempotent():
+    units = [Unit(name=n, sources=[f"{n}.java"], description=n) for n in ("A", "B", "Base", "Next")]
+    deps = {"A": {"B", "Base"}, "B": {"A"}, "Next": {"A", "B"}}
+    merged, edges = merge_cyclic_units(units, deps)
+    group = next(unit for unit in merged if len(unit.sources) == 2)
+    assert group.sources == ["A.java", "B.java"]
+    assert edges[group.name] == {"Base"} and edges["Next"] == {group.name}
+    assert next(unit for unit in merged if unit.name == "Base") is units[2]
+    layers, cycles = topological_sort(merged, edges)
+    assert not cycles and [unit.name for unit in layers[1]] == [group.name]
+    again, again_edges = merge_cyclic_units(merged, edges)
+    assert again_edges == edges and {u.name for u in again} == {u.name for u in merged}
 
 
 # ============================================================

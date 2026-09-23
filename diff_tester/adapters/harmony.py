@@ -17,6 +17,7 @@ import re
 import tempfile
 import time
 import uuid
+from run_control import BudgetExceeded, check_budget, remaining_timeout
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..normalize import find_harmony_page_hint, parse_harmony_dump
@@ -44,6 +45,12 @@ class HarmonyAdapter(DeviceAdapter):
         self._hm_broken = False         # hmdriver2 初始化/调用失败后永久降级到 hdc
         self._fault_baseline: Optional[set[str]] = None
         self._last_page_hint: Optional[str] = None
+        self._backend_reason = ""
+
+    def use_bounded_backend(self):
+        """Installed hmdriver2 has unbounded subprocess calls; gate uses timed hdc."""
+        self._hm_broken = True
+        self._backend_reason = "hdc selected because hmdriver2 subprocess calls lack a deadline"
 
     # -- 内部工具 ---------------------------------------------------------------
 
@@ -54,12 +61,16 @@ class HarmonyAdapter(DeviceAdapter):
         return base + list(args)
 
     def _hdc(self, *args: str, check: bool = True, timeout: Optional[float] = None):
-        return run_command(
+        result = run_command(
             self._hdc_args(*args),
             timeout_s=timeout or self.cfg.device.cmd_timeout_s,
             retries=self.cfg.device.cmd_retries,
             check=check,
         )
+        if check and re.search(r"(?:error:|\[fail\]|failed|failure)",
+                               (result.stdout or "") + (result.stderr or ""), re.I):
+            raise CommandError(f"hdc reported failure: {' '.join(args)}: {result.stdout} {result.stderr}")
+        return result
 
     def _driver(self):
         """hmdriver2 Driver；不可用返回 None（此后走 hdc 兜底）。"""
@@ -67,16 +78,31 @@ class HarmonyAdapter(DeviceAdapter):
             return None
         if self._hm is None:
             try:
+                # hmdriver2 invokes literal `hdc`; align its PATH with the
+                # configured backend before creating the driver.
+                configured = os.path.abspath(self.cfg.device.hdc_path)
+                if os.path.isfile(configured):
+                    os.environ["HDCPATH"] = configured
+                    os.environ["PATH"] = os.path.dirname(configured) + os.pathsep + os.environ.get("PATH", "")
                 from hmdriver2.driver import Driver
                 self._hm = Driver(self.serial) if self.serial else Driver()
+            except BudgetExceeded:
+                raise
             except Exception as e:
                 logger.warning("hmdriver2 不可用(%s)，全部走 hdc uitest 兜底", e)
                 self._hm_broken = True
                 return None
         return self._hm
 
+    def deployment_identity(self) -> dict:
+        return {"bundle": self.bundle, "serial": self.serial,
+                "hdc_path": os.path.abspath(self.cfg.device.hdc_path),
+                "driver": "hmdriver2" if self._hm is not None and not self._hm_broken else "hdc",
+                "backend_reason": self._backend_reason}
+
     def _hm_call(self, fn_name: str, *args, **kw):
         """带降级保护的 hmdriver2 调用；失败抛异常由调用方兜底。"""
+        check_budget()
         drv = self._driver()
         if drv is None:
             raise CommandError("hmdriver2 不可用")
@@ -93,22 +119,28 @@ class HarmonyAdapter(DeviceAdapter):
                    if t.strip() and "Empty" not in t]
         if not targets:
             raise CommandError("hdc 未检测到任何设备（hdc list targets 为空）")
+        if not self.serial:
+            if len(targets) != 1:
+                raise CommandError("Multiple Harmony devices are online; specify a device serial")
+            self.serial = targets[0].split()[0]
         if self.serial and not any(self.serial in t for t in targets):
             raise CommandError(f"hdc 设备 {self.serial} 不在线。当前在线: {targets}")
-        cp = self._hdc("shell", "bm", "dump", "-n", self.bundle, check=False)
+        cp = self._hdc("shell", "bm", "dump", "-n", self.bundle)
         if self.bundle not in (cp.stdout or ""):
             raise CommandError(f"应用 {self.bundle} 未安装（bm dump 无结果）")
 
     def reset_app(self) -> None:
-        self._hdc("shell", "bm", "clean", "-n", self.bundle, "-d", check=False)
-        self._hdc("shell", "aa", "force-stop", self.bundle, check=False)
+        self._last_page_hint = None
+        self._hdc("shell", "aa", "force-stop", self.bundle)
+        self._hdc("shell", "bm", "clean", "-n", self.bundle, "-d")
         # 崩溃基线必须在启动前快照：若启动即崩，faultlogger 新文件才可被
         # poll_crash 检出（此前基线在启动后快照，会把启动崩溃"吞"进基线）
         self._snapshot_faults()
         self._hdc("shell", "aa", "start", "-a", self.ability, "-b", self.bundle,
-                  check=False)
-        time.sleep(self.cfg.device.launch_wait_s)
-        self.wait_stable()
+                  check=True)
+        time.sleep(remaining_timeout(self.cfg.device.launch_wait_s))
+        check_budget()
+        stable = self.wait_stable()
         # 启动健康检查：进程死亡或产生崩溃文件 → 抛类型化异常，
         # 回放器据此直接判 L0_CRASH，避免误诊为控件映射失败
         crash_sig = self.poll_crash()
@@ -119,6 +151,8 @@ class HarmonyAdapter(DeviceAdapter):
                 f"（alive={alive}, crash_sig={crash_sig}）",
                 crash_sig=crash_sig, alive=alive,
             )
+        if not stable:
+            raise CommandError("Initial screen did not stabilize after reset")
 
     def dump_tree(self) -> UNode:
         data = self._dump_raw()
@@ -133,6 +167,8 @@ class HarmonyAdapter(DeviceAdapter):
                 if isinstance(data, dict) and data:
                     return data
             except Exception as e:
+                if isinstance(e, BudgetExceeded):
+                    raise
                 logger.debug("hmdriver2 dump 失败(%s)，走 hdc 兜底", e)
         # 兜底：uitest dumpLayout 到设备文件再取回
         remote = f"/data/local/tmp/_dt_layout_{uuid.uuid4().hex[:8]}.json"
@@ -154,6 +190,8 @@ class HarmonyAdapter(DeviceAdapter):
                 self._hm_call("screenshot", path)
                 return
             except Exception as e:
+                if isinstance(e, BudgetExceeded):
+                    raise
                 logger.debug("hmdriver2 截图失败(%s)，走 hdc 兜底", e)
         remote = f"/data/local/tmp/_dt_shot_{uuid.uuid4().hex[:8]}.png"
         cp = self._hdc("shell", "uitest", "screenCap", "-p", remote, check=False)
@@ -218,7 +256,8 @@ class HarmonyAdapter(DeviceAdapter):
             x, y = node.center_abs()
             text = ev.params.get("text", "")
             self._input("click", str(x), str(y), hm=("click", x, y))
-            time.sleep(0.3)
+            time.sleep(remaining_timeout(0.3))
+            check_budget()
             if text == "":
                 return
             self._input("inputText", str(x), str(y), text, hm=("input_text", text))
@@ -236,9 +275,12 @@ class HarmonyAdapter(DeviceAdapter):
         elif action == "HOME":
             self._input("keyEvent", "Home", hm=("go_home",))
         elif action == "ROTATE":
-            logger.warning("鸿蒙 ROTATE 暂未实现，跳过")
+            raise CommandError("ROTATE is unsupported by the Harmony backend")
         elif action == "WAIT_IDLE":
-            time.sleep(float(ev.params.get("timeout", 2.0)))
+            delay = max(0.0, float(ev.params.get("timeout", 2.0)))
+            if delay:
+                time.sleep(remaining_timeout(delay))
+            check_budget()
         else:
             raise ValueError(f"未知动作: {action}")
 
@@ -249,6 +291,8 @@ class HarmonyAdapter(DeviceAdapter):
                 self._hm_call(hm[0], *hm[1:])
                 return
             except Exception as e:
+                if isinstance(e, BudgetExceeded):
+                    raise
                 logger.debug("hmdriver2 %s 失败(%s)，走 uitest 兜底", hm[0], e)
         self._hdc("shell", "uitest", "uiInput", *uitest_args)
 
@@ -256,8 +300,10 @@ class HarmonyAdapter(DeviceAdapter):
         try:
             tree = self.dump_tree()
             return tree.abs_bounds[2] or 1080, tree.abs_bounds[3] or 2340
-        except Exception:
-            return 1080, 2340
+        except BudgetExceeded:
+            raise
+        except Exception as exc:
+            raise CommandError("Cannot determine actual screen size") from exc
 
     def poll_crash(self) -> Optional[str]:
         """faultlogger 目录增量检测新崩溃文件。"""

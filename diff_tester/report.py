@@ -4,18 +4,27 @@ from __future__ import annotations
 import os
 import time
 
-from .schemas import TraceResult, save_json
+from .schemas import DivergenceReport, TraceResult, save_json
 
 _METRIC_LABELS = [
     ("traces", "轨迹数"),
     ("total_events", "事件总数"),
     ("R_replay", "事件可回放率 R_replay"),
-    ("R_eq", "状态一致率 R_eq"),
+    ("R_eq_direct", "直接状态一致率 R_eq_direct"),
+    ("R_eq_policy", "含中介策略一致率 R_eq_policy"),
     ("trace_pass_rate", "轨迹通过率"),
-    ("avg_norm_divergence_depth", "归一化首分叉深度"),
+    ("avg_norm_divergence_depth", "归一化成功前缀深度"),
     ("page_coverage_align_rate", "页面覆盖对齐率"),
     ("widget_recall", "控件召回率"),
     ("unmapped_count", "UNMAPPED 计数"),
+    ("executed_steps", "已执行步数"),
+    ("compared_steps", "已比较步数"),
+    ("policy_evaluated_steps", "有结论的已执行步数"),
+    ("verified_steps", "已验证通过步数"),
+    ("direct_verified_steps", "直接验证通过步数"),
+    ("mediated_steps", "中介恢复后通过步数"),
+    ("external_recovery_failures", "外部表面恢复失败数"),
+    ("soft_failed_steps", "软失败步数"),
 ]
 
 _KIND_ZH = {
@@ -24,6 +33,14 @@ _KIND_ZH = {
     "L0_CRASH": "状态分叉·崩溃",
     "L1_PAGE": "状态分叉·页面身份",
     "L2_CONTENT": "状态分叉·语义内容",
+    "EXTERNAL_PROTOCOL": "外部系统表面协议",
+    "EXTERNAL_SURFACE": "外部系统表面协议（旧格式）",
+    "STARTUP_STATE_MISMATCH": "启动状态不一致",
+    "PRECONDITION_MISMATCH": "动作前状态不一致",
+    "BASELINE_INVALID": "基线无效",
+    "INFRA_ERROR": "基础设施错误",
+    "BUDGET_EXHAUSTED": "预算耗尽",
+    "UNSTABLE": "界面未稳定",
 }
 
 _CATEGORY_ZH = {
@@ -55,6 +72,21 @@ def write_reports(metrics: dict, results: list[TraceResult], out_dir: str) -> tu
     return json_path, md_path
 
 
+def _divergences_for(result: TraceResult) -> list[DivergenceReport]:
+    """Return every divergence while accepting the legacy singular field.
+
+    ``TraceResult.__post_init__`` normally keeps the two fields in sync, but
+    report generation also consumes results loaded from older runs and test
+    doubles that may only provide ``divergence``.  Preserve the explicit list
+    ordering because continued replay records soft failures by step.
+    """
+    reports = list(getattr(result, "divergences", ()) or ())
+    if reports:
+        return reports
+    legacy = getattr(result, "divergence", None)
+    return [legacy] if legacy is not None else []
+
+
 def _render_md(metrics: dict, results: list[TraceResult]) -> str:
     lines: list[str] = []
     lines.append("# 安卓→鸿蒙翻译差分测试报告")
@@ -69,7 +101,8 @@ def _render_md(metrics: dict, results: list[TraceResult]) -> str:
     lines.append("|---|---|")
     for key, label in _METRIC_LABELS:
         if key in metrics:
-            lines.append(f"| {label} | {metrics[key]} |")
+            value = "N/A（无有效样本）" if metrics[key] is None else metrics[key]
+            lines.append(f"| {label} | {value} |")
     lines.append("")
 
     # ---- 缺陷谱 ----
@@ -107,32 +140,47 @@ def _render_md(metrics: dict, results: list[TraceResult]) -> str:
     # ---- 每条轨迹明细 ----
     lines.append("## 三、轨迹明细")
     lines.append("")
-    lines.append("| 轨迹 | 步数 | 已执行 | 结果 | 首分叉步 | 分叉类型 | 归因 | artifacts |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("| 轨迹 | 步数 | 已执行 | 已验证 | 结果 | 首分叉步 | 分叉类型 | 归因 | artifacts |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for r in results:
-        d = r.divergence
-        lines.append("| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+        divergences = _divergences_for(r)
+        kinds = "、".join(_KIND_ZH.get(d.kind, d.kind) for d in divergences) or "-"
+        categories = "、".join(
+            _CATEGORY_ZH.get(d.category, d.category or "未归因")
+            for d in divergences
+        ) or "-"
+        artifacts = "、".join(dict.fromkeys(
+            d.artifacts_dir.replace("\\", "/")
+            for d in divergences if d.artifacts_dir
+        )) or "-"
+        lines.append("| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
             r.trace_id,
             r.total_steps,
             r.executed_steps,
-            "通过" if r.passed else "分叉",
-            r.first_divergence_step or "-",
-            _KIND_ZH.get(d.kind, d.kind) if d else "-",
-            _CATEGORY_ZH.get(d.category, d.category or "未归因") if d else "-",
-            d.artifacts_dir.replace("\\", "/") if d and d.artifacts_dir else "-",
+            r.verified_steps,
+            r.status if r.status else ("通过" if r.passed else "分叉"),
+            r.first_divergence_step if r.first_divergence_step is not None else "-",
+            kinds,
+            categories,
+            artifacts,
         ))
     lines.append("")
 
     # ---- 分叉详情 ----
-    diverged = [r for r in results if r.divergence]
+    diverged = [
+        (r, divergence)
+        for r in results
+        for divergence in _divergences_for(r)
+    ]
     if diverged:
         lines.append("## 四、分叉详情")
         lines.append("")
-        for r in diverged:
-            d = r.divergence
+        for r, d in diverged:
             lines.append(f"### {r.trace_id} · step {d.diverged_step} · "
                          f"{_KIND_ZH.get(d.kind, d.kind)}")
             lines.append("")
+            if d.soft_failure:
+                lines.append("- 回放控制：软失败，已继续后续步骤")
             if d.android_state:
                 lines.append(f"- 期望页面（安卓基线）：`{d.android_state.page}`")
             if d.harmony_state:

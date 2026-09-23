@@ -13,7 +13,8 @@ from typing import Optional, Union
 from rapidfuzz import fuzz
 
 from .config import MatcherConfig
-from .schemas import MatchResult, TargetFingerprint, UNode
+from .schemas import (MatchResult, TargetFingerprint, UNode,
+                      semantic_widget_role)
 
 #: 兼容角色对（sim_role = 0.5）
 _COMPATIBLE_ROLES: set[frozenset[str]] = {
@@ -71,10 +72,13 @@ def _sim_id(fp: TargetFingerprint, c: UNode) -> Optional[float]:
     return fuzz.ratio(fp.id_hint, c.id) / 100.0
 
 
-def _sim_role(fp: TargetFingerprint, c: UNode) -> float:
-    if fp.role == c.role:
+def _sim_role(fp: TargetFingerprint, c: UNode, action: str) -> float:
+    source_role = semantic_widget_role(
+        fp.role, action in ("CLICK", "LONG_CLICK"))
+    candidate_role = semantic_widget_role(c.role, c.clickable)
+    if source_role == candidate_role:
         return 1.0
-    if _roles_compatible(fp.role, c.role):
+    if _roles_compatible(source_role, candidate_role):
         return 0.5
     return 0.0
 
@@ -140,18 +144,26 @@ def match(
 
     weights = {"id": cfg.w_id, "text": cfg.w_text, "role": cfg.w_role,
                "pos": cfg.w_pos, "img": cfg.w_img}
+    exact_id_count = sum(
+        1 for candidate in cands
+        if fp.id_hint and candidate.id == fp.id_hint
+    )
     scored: list[tuple[float, UNode, dict]] = []
     for c in cands:
         comps: dict[str, Optional[float]] = {
             "id": _sim_id(fp, c),
             "text": _sim_text(fp, c),
-            "role": _sim_role(fp, c),
+            "role": _sim_role(fp, c, action),
             "pos": _sim_pos(fp, c),
             "img": _sim_img(fp, c, screen_image),
         }
         present = {k: v for k, v in comps.items() if v is not None}
         total_w = sum(weights[k] for k in present)
         score = sum(weights[k] * v for k, v in present.items()) / total_w if total_w > 0 else 0.0
+        # Resource IDs are the cross-platform behavior contract. A unique
+        # exact ID is deterministic even when layout and rendering differ.
+        if exact_id_count == 1 and fp.id_hint and c.id == fp.id_hint:
+            score = 1.0
         scored.append((score, c, {k: (round(v, 4) if v is not None else None)
                                   for k, v in comps.items()}))
 
@@ -175,5 +187,12 @@ def match(
         node=top1_node if kind != "UNMAPPED" else None,
         score=top1_score,
         second_score=top2_score,
-        detail={"top": top_detail},
+        detail={
+            "top": top_detail,
+            "strategy": (
+                "unique_exact_id"
+                if exact_id_count == 1 and top1_node.id == fp.id_hint
+                else "weighted_similarity"
+            ),
+        },
     )

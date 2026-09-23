@@ -176,26 +176,53 @@ def parse_manifest(path: str) -> dict:
         "permissions": [],
         "application_label": "",
         "application_icon": "",
+        "launchers": [],
+        "activity_aliases": [],
     }
     try:
         tree = ET.parse(path)
         root = tree.getroot()
         info["package"] = root.attrib.get("package", "")
+        namespace = "{http://schemas.android.com/apk/res/android}"
+
+        def qualified(name: str) -> str:
+            if name.startswith("."):
+                return info["package"] + name
+            return info["package"] + "." + name if "." not in name and info["package"] else name
+
+        def is_launcher(element) -> bool:
+            if element.attrib.get(namespace + "enabled", "true") == "false":
+                return False
+            for intent in element.findall("intent-filter"):
+                actions = {child.attrib.get(namespace + "name") for child in intent.findall("action")}
+                categories = {child.attrib.get(namespace + "name") for child in intent.findall("category")}
+                if "android.intent.action.MAIN" in actions and "android.intent.category.LAUNCHER" in categories:
+                    return True
+            return False
 
         for elem in root.iter():
             tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
             if tag == "activity":
                 info["activities"].append({
-                    "name": elem.attrib.get("{http://schemas.android.com/apk/res/android}name", ""),
+                    "name": qualified(elem.attrib.get(namespace + "name", "")),
                     "exported": elem.attrib.get("{http://schemas.android.com/apk/res/android}exported", ""),
                 })
+                if is_launcher(elem):
+                    name = qualified(elem.attrib.get(namespace + "name", ""))
+                    info["launchers"].append({"component": name, "activity": name})
+            elif tag == "activity-alias":
+                alias = {"component": qualified(elem.attrib.get(namespace + "name", "")),
+                         "activity": qualified(elem.attrib.get(namespace + "targetActivity", ""))}
+                info["activity_aliases"].append(alias)
+                if is_launcher(elem):
+                    info["launchers"].append(alias)
             elif tag == "uses-permission":
                 info["permissions"].append(elem.attrib.get("{http://schemas.android.com/apk/res/android}name", ""))
             elif tag == "application":
                 info["application_label"] = elem.attrib.get("{http://schemas.android.com/apk/res/android}label", "@string/app_name")
                 info["application_icon"] = elem.attrib.get("{http://schemas.android.com/apk/res/android}icon", "@mipmap/ic_launcher")
-    except Exception:
-        pass
+    except (OSError, ET.ParseError) as exc:
+        info["error"] = str(exc)
     return info
 
 

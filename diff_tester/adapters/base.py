@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import time
+from run_control import BudgetExceeded, check_budget, remaining_timeout
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -41,11 +42,14 @@ def run_command(
     """执行外部命令（adb/hdc），带超时与重试。"""
     last_err: Optional[Exception] = None
     for attempt in range(retries + 1):
+        check_budget()
         try:
+            effective_timeout = remaining_timeout(timeout_s)
             cp = subprocess.run(
                 args, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout_s,
+                encoding="utf-8", errors="replace", timeout=effective_timeout,
             )
+            check_budget()
             if check and cp.returncode != 0:
                 raise CommandError(
                     f"命令失败(rc={cp.returncode}): {' '.join(args)}\n"
@@ -53,6 +57,7 @@ def run_command(
                 )
             return cp
         except subprocess.TimeoutExpired as e:
+            check_budget()
             last_err = CommandError(f"命令超时({timeout_s}s): {' '.join(args)}")
             logger.warning("%s (第 %d 次)", last_err, attempt + 1)
         except CommandError as e:
@@ -61,14 +66,17 @@ def run_command(
         except FileNotFoundError as e:
             raise CommandError(f"找不到可执行文件: {args[0]}（请检查 config 中的路径）") from e
         if attempt < retries:
-            time.sleep(1.0)
+            check_budget()
+            time.sleep(min(1.0, remaining_timeout(1.0)))
     assert last_err is not None
     raise last_err
 
 
 def run_command_binary(args: list[str], timeout_s: float = 30.0) -> bytes:
     """二进制输出版本（截图等）。"""
-    cp = subprocess.run(args, capture_output=True, timeout=timeout_s)
+    check_budget()
+    cp = subprocess.run(args, capture_output=True, timeout=remaining_timeout(timeout_s))
+    check_budget()
     if cp.returncode != 0:
         raise CommandError(
             f"命令失败(rc={cp.returncode}): {' '.join(args)}\n"
@@ -125,23 +133,33 @@ class DeviceAdapter(ABC):
     # -- 公共实现 -------------------------------------------------------------
 
     def wait_stable(self, timeout_s: Optional[float] = None) -> bool:
-        """界面稳定判据（§4.6）：连续两次 dump 树哈希相同且间隔 >= stable_interval_s。
+        """界面稳定判据（§4.6）：连续多次 dump 树哈希相同。
 
         超时仍在变化 → 返回 False（UNSTABLE，用最后一帧参与比较）。
         """
-        timeout = timeout_s if timeout_s is not None else self.cfg.device.stable_timeout_s
+        timeout = remaining_timeout(timeout_s if timeout_s is not None else self.cfg.device.stable_timeout_s)
         interval = self.cfg.device.stable_interval_s
+        required_samples = max(2, int(self.cfg.device.stable_samples))
         deadline = time.monotonic() + timeout
         prev: Optional[str] = None
+        consecutive = 0
         while time.monotonic() < deadline:
+            check_budget()
             try:
                 h = self.dump_tree().tree_hash()
+            except BudgetExceeded:
+                raise
             except Exception as e:
                 logger.debug("wait_stable dump 失败: %s", e)
-                time.sleep(interval)
+                time.sleep(remaining_timeout(interval))
                 continue
-            if prev is not None and h == prev:
+            if h == prev:
+                consecutive += 1
+            else:
+                prev = h
+                consecutive = 1
+            if consecutive >= required_samples:
                 return True
-            prev = h
-            time.sleep(interval)
+            time.sleep(remaining_timeout(interval))
+        check_budget()
         return False

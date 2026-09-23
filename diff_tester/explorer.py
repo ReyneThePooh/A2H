@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import time
+from run_control import BudgetExceeded, check_budget
 from typing import TYPE_CHECKING, Optional
 
 from .config import Config
@@ -71,6 +72,7 @@ def explore(
     out_paths: list[str] = []
 
     for k in range(n_traces):
+        check_budget()
         trace_id = f"trace_{k:03d}"
         art_dir = os.path.join(artifacts_root, trace_id)
         os.makedirs(art_dir, exist_ok=True)
@@ -88,23 +90,37 @@ def explore(
                 "recorder": "explorer",
             },
         )
+        trace.initial_state = alpha(android, masks, art_dir, "initial")
 
         step = 0
+        seed_prefix_failed = False
         # ---- 种子前缀：在安卓自身树上定位并执行（自回放校验种子有效）----------
         if seeds:
             seed = seeds[k % len(seeds)]
-            trace.meta["seed"] = seed.trace_id
+            trace.meta.update({
+                "seed": seed.trace_id,
+                "seed_status": "pending",
+                "seed_prefix_expected_steps": len(seed.events),
+                "seed_prefix_completed_steps": 0,
+            })
             step = _replay_seed_prefix(android, cfg, masks, seed, trace, art_dir)
-            if step < 0:   # 种子自回放失败，本轨迹作废种子部分、从头随机
-                logger.warning("[record] %s 种子 %s 自回放失败，改为纯随机",
+            completed_steps = step if step >= 0 else len(trace.events)
+            trace.meta["seed_prefix_completed_steps"] = completed_steps
+            if step < 0:
+                logger.warning("[record] %s 种子 %s 自回放失败，拒绝随机替代",
                                trace_id, seed.trace_id)
-                android.reset_app()
                 trace.events.clear()
+                trace.meta["seed_status"] = "failed"
+                trace.meta["ended_by"] = "seed_prefix_failed"
                 step = 0
+                seed_prefix_failed = True
+            else:
+                trace.meta["seed_status"] = "completed"
 
         # ---- 随机探索 --------------------------------------------------------
         empty_rounds = 0
-        while step < max_steps:
+        while not seed_prefix_failed and step < max_steps:
+            check_budget()
             step += 1
             tree = android.dump_tree()
             page = android.current_page()
@@ -115,8 +131,10 @@ def explore(
                 trace.meta["ended_by"] = "app_dead"
                 break
             fg = android.current_pkg()
-            if fg and fg != android.pkg:
-                trace.meta["ended_by"] = f"foreground_lost:{fg}"
+            if fg != android.pkg:
+                trace.meta["ended_by"] = (
+                    f"foreground_lost:{fg}" if fg else "foreground_unknown"
+                )
                 break
 
             candidates = [n for n in tree.iter_interactive() if n.rel_area() > 0]
@@ -136,21 +154,36 @@ def explore(
                 screen_png = os.path.join(art_dir, f"step{step}_screen.png")
                 try:
                     android.screenshot(screen_png)
+                except BudgetExceeded:
+                    raise
                 except Exception:
                     screen_png = None
                 patch = os.path.join(art_dir, f"step{step}_target.png")
                 ev.target = _make_fingerprint(node, screen_png, patch)
                 visited.add(_node_key(node))
             ev.pre_state_hash = pre_state.hash()
+            ev.pre_state = pre_state
 
             try:
                 android.execute(ev, node)
             except Exception as e:
+                if isinstance(e, BudgetExceeded):
+                    raise
                 logger.warning("[record] %s step%d 执行失败(%s)，终止本轨迹",
                                trace_id, step, e)
                 trace.meta["ended_by"] = f"exec_error:{e}"
                 break
             stable = android.wait_stable()
+            post_pkg = android.current_pkg()
+            if post_pkg != android.pkg:
+                # Random exploration has no pre-declared external-surface
+                # contract. Do not persist a system-owned or unknown window as
+                # an application baseline for a later translation repair.
+                trace.meta["ended_by"] = (
+                    f"undeclared_external_surface:{post_pkg}"
+                    if post_pkg else "post_state_ownership_unknown"
+                )
+                break
             ev.post_state = alpha(android, masks, art_dir, f"step{step}")
             if not stable:
                 trace.meta.setdefault("unstable_steps", []).append(step)
@@ -219,6 +252,7 @@ def _replay_seed_prefix(
     """
     step = 0
     for sev in seed.events:
+        check_budget()
         step += 1
         tree = android.dump_tree()
         page = android.current_page()
@@ -233,24 +267,78 @@ def _replay_seed_prefix(
                 return -1
             node = m.node
 
-        ev = AbstractEvent(step=step, action=sev.action, target=None,
-                           params=dict(sev.params))
+        ev = AbstractEvent(
+            step=step,
+            action=sev.action,
+            target=None,
+            params=dict(sev.params),
+            external_surface=sev.external_surface,
+        )
         if node is not None:
             screen_png = os.path.join(art_dir, f"step{step}_screen.png")
             try:
                 android.screenshot(screen_png)
+            except BudgetExceeded:
+                raise
             except Exception:
                 screen_png = None
             patch = os.path.join(art_dir, f"step{step}_target.png")
             ev.target = _make_fingerprint(node, screen_png, patch)
         ev.pre_state_hash = pre_state.hash()
+        ev.pre_state = pre_state
 
         try:
             android.execute(ev, node)
         except Exception as e:
+            if isinstance(e, BudgetExceeded):
+                raise
             logger.warning("[seed] step%d 执行失败: %s", step, e)
             return -1
-        android.wait_stable()
+        if not android.wait_stable():
+            logger.warning("[seed] step%d 执行后界面未稳定", step)
+            return -1
+
+        foreground = android.current_pkg()
+        if not foreground:
+            logger.warning("[seed] step%d 无法确认执行后前台所有权", step)
+            return -1
+        if foreground != android.pkg:
+            contract = ev.external_surface
+            if contract is None:
+                logger.warning(
+                    "[seed] step%d 前台切换到 %s，但事件未声明外部表面协议",
+                    step, foreground,
+                )
+                return -1
+            recovery = AbstractEvent(
+                step=step,
+                action=contract.recovery_action,
+                target=None,
+            )
+            try:
+                android.execute(recovery, None)
+            except Exception as e:
+                if isinstance(e, BudgetExceeded):
+                    raise
+                logger.warning("[seed] step%d 外部表面恢复失败: %s", step, e)
+                return -1
+            if not android.wait_stable():
+                logger.warning("[seed] step%d 外部表面恢复后界面未稳定", step)
+                return -1
+            recovered_pkg = android.current_pkg()
+            if recovered_pkg != android.pkg:
+                logger.warning(
+                    "[seed] step%d 恢复后前台仍非应用: %s",
+                    step, recovered_pkg or "<unknown>",
+                )
+                return -1
+
         ev.post_state = alpha(android, masks, art_dir, f"step{step}")
+        if ev.post_state.external_surface is not None:
+            logger.warning(
+                "[seed] step%d post_state 仍属于外部表面 %s",
+                step, ev.post_state.external_surface,
+            )
+            return -1
         trace.events.append(ev)
     return step

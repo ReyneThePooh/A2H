@@ -169,7 +169,11 @@ cython_debug/
 
 # Temporary/experimental helper scripts.
 # Put stable, reusable scripts under scripts/ instead.
-tools/
+!tools/
+tools/*
+!tools/select_seeds.py
+!tools/summarize_replay.py
+!tools/index_arkts.py
 
 # Runtime work directories and generated conversion/check artifacts
 HCW/
@@ -189,3 +193,6 @@ artifacts/
 # 差分测试门禁运行产物
 .pytest_tmp/
 .diff_gate/
+.a2h_runs/
+.build_attempts/
+.analysis_tmp/

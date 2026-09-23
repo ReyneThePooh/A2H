@@ -12,6 +12,7 @@ device:
   cmd_retries: 1
   stable_timeout_s: 10.0     # 界面稳定判据超时
   stable_interval_s: 0.5
+  stable_samples: 3          # 连续三帧一致才视为稳定
   launch_wait_s: 3.0
   harmony_ability: "EntryAbility"   # aa start 的 ability 名，按被测 HAP 修改
 

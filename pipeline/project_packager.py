@@ -15,7 +15,13 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
+from run_control import run_process
+from pipeline.artifacts import (
+    ArtifactContractError, MANIFEST_NAME, atomic_write_json, code_without_comments,
+    content_hash, load_artifact_manifest, project_source_fingerprint, refresh_artifact_hashes, validate_project_contract,
+)
 
 # 模板中不需要复制的缓存/产物目录
 TEMPLATE_IGNORES = {"build", ".hvigor", ".idea", "oh_modules", ".preview"}
@@ -314,7 +320,7 @@ def _normalize_app_label(target_res: Path):
 # ============================================================
 
 def _choose_entry_page(pages: list[str], generated_main_pages: Path) -> str:
-    """选择入口页：生成侧 main_pages.json 首项 > MainPage > Index > 字典序第一个"""
+    """Legacy explicit configuration reader; never guess from names or sorting."""
     if generated_main_pages.exists():
         try:
             configured = json.loads(generated_main_pages.read_text(encoding="utf-8")).get("src", [])
@@ -325,27 +331,24 @@ def _choose_entry_page(pages: list[str], generated_main_pages: Path) -> str:
                     return first
         except Exception:
             pass
-    for candidate in ("pages/MainPage", "pages/Index"):
-        if candidate in pages:
-            return candidate
-    return pages[0]
+    raise ArtifactContractError("An explicit, valid launcher route is required")
 
 
-def _register_pages(target_main: Path, generated_main_pages: Path) -> str:
+def _register_pages(target_main: Path, generated_main_pages: Path, manifest: dict | None = None) -> str:
     """把 pages/ 下真正的页面（含 @Entry 装饰器）注册进 main_pages.json，返回入口页。
 
     模型/组件等无 @Entry 的 .ets 若被注册，编译器会报 10905402。
     """
-    pages_dir = target_main / "ets" / "pages"
-    pages = sorted(
-        f"pages/{p.stem}"
-        for p in pages_dir.glob("*.ets")
-        if "@Entry" in p.read_text(encoding="utf-8", errors="replace")
-    )
+    if manifest is None:
+        raise ArtifactContractError("Page registration requires a translation manifest")
+    pages = sorted(output["route"] for output in manifest["outputs"] if output["role"] == "page")
     if not pages:
-        raise FileNotFoundError(f"未找到任何含 @Entry 的页面: {pages_dir}")
+        raise ArtifactContractError("Manifest has no runnable pages")
 
-    entry_page = _choose_entry_page(pages, generated_main_pages)
+    launcher = manifest.get("launcher")
+    if not isinstance(launcher, dict) or launcher.get("route") not in pages:
+        raise ArtifactContractError("Manifest has no valid launcher mapping")
+    entry_page = launcher["route"]
     ordered = [entry_page] + [p for p in pages if p != entry_page]
 
     profile_dir = target_main / "resources" / "base" / "profile"
@@ -369,9 +372,9 @@ def _register_pages(target_main: Path, generated_main_pages: Path) -> str:
             entry_ability.write_text(updated, encoding="utf-8")
             print(f"  EntryAbility.loadContent → {entry_page}")
         else:
-            print("  ⚠️ EntryAbility.ets 中未找到 loadContent，入口页未同步")
+            raise ArtifactContractError("EntryAbility has no loadContent to update")
     else:
-        print("  ⚠️ 模板缺少 EntryAbility.ets")
+        raise ArtifactContractError("Template is missing EntryAbility.ets")
 
     return entry_page
 
@@ -535,6 +538,10 @@ def package_project(
     src_ets = src_main / "ets"
     if not src_ets.exists():
         raise FileNotFoundError(f"生成侧无 ets 目录: {src_ets}")
+    manifest = load_artifact_manifest(generated_dir)
+    issues = validate_project_contract(generated_dir)
+    if issues:
+        raise ArtifactContractError("Translation contract rejected packaging: " + json.dumps(issues, ensure_ascii=False))
 
     print("=" * 50)
     print("工程打包（套 DevEco 模板）")
@@ -554,7 +561,8 @@ def package_project(
         _merge_generated_resources(src_res, target_main / "resources")
     _normalize_app_label(target_main / "resources")
 
-    _register_pages(target_main, src_res / "base" / "profile" / "main_pages.json")
+    shutil.copy2(generated_dir / MANIFEST_NAME, output_dir / MANIFEST_NAME)
+    _register_pages(target_main, src_res / "base" / "profile" / "main_pages.json", manifest)
     rewrite_flat_imports(target_main / "ets" / "pages")
     _inject_permissions(
         target_main / "module.json5",
@@ -562,6 +570,10 @@ def package_project(
         target_main / "resources" / "base" / "element" / "string.json",
     )
     validate_resource_names(target_main / "resources")
+    refresh_artifact_hashes(output_dir)
+    issues = validate_project_contract(output_dir)
+    if issues:
+        raise ArtifactContractError("Packaged contract is invalid: " + json.dumps(issues, ensure_ascii=False))
 
     print(f"  打包完成: {output_dir}")
     return output_dir
@@ -576,7 +588,8 @@ def run_hvigor(project_dir: str | Path, task: str = "assembleHap") -> subprocess
 
     需要 NODE_HOME 指向 DevEco 自带 node。找不到 hvigorw.bat 时抛 FileNotFoundError。
     """
-    project_dir = Path(project_dir)
+    from run_control import consume_budget, remaining_timeout
+    project_dir = Path(project_dir).resolve()
     hvigorw = project_dir / "hvigorw.bat"
     if not hvigorw.exists():
         raise FileNotFoundError(f"未找到 hvigorw.bat: {hvigorw}")
@@ -586,17 +599,65 @@ def run_hvigor(project_dir: str | Path, task: str = "assembleHap") -> subprocess
     if node_home:
         env["PATH"] = node_home + os.pathsep + env.get("PATH", "")
 
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9:_-]*", task):
+        raise ValueError("Invalid Hvigor task name")
+    fingerprint = project_source_fingerprint(project_dir)
+    metadata_path = project_dir / ".pipeline_build.json"
+    previous_artifacts = {}
+    try:
+        previous = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if (isinstance(previous, dict) and previous.get("status") == "success"
+                and previous.get("project_input_sha256") == fingerprint):
+            previous_artifacts = {item["path"]: item["sha256"] for item in previous.get("artifacts", [])
+                                  if isinstance(item, dict) and isinstance(item.get("path"), str)
+                                  and isinstance(item.get("sha256"), str)}
+    except (OSError, ValueError, TypeError):
+        pass
+    before_artifacts = {hap.relative_to(project_dir).as_posix(): content_hash(hap.read_bytes())
+                        for hap in (project_dir / "entry/build").rglob("*.hap") if hap.is_file()}
+    started = time.time()
+    metadata = {"status": "running", "task": task, "started_at": started,
+                "project_input_sha256": fingerprint, "artifacts": []}
+    atomic_write_json(metadata_path, metadata)
     print(f"\n构建: hvigorw {task} @ {project_dir}")
-    return subprocess.run(
-        f'"{hvigorw}" {task}',
-        cwd=project_dir,
-        capture_output=True,
-        text=True,
-        shell=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-    )
+    # DevEco 的全局 daemon 偶尔会遗留注册锁，导致后续构建直接失败；
+    # 使用无 daemon 模式保证断点续跑和每轮自动修复都能独立启动。
+    try:
+        consume_budget("builds")
+        result = run_process(
+            f'"{hvigorw}" {task} --no-daemon', cwd=project_dir,
+            capture_output=True, text=True, shell=True, encoding="utf-8",
+            errors="replace", env=env, timeout=remaining_timeout(600),
+        )
+        unchanged = fingerprint == project_source_fingerprint(project_dir)
+        metadata["status"] = "success" if result.returncode == 0 and unchanged else "failed"
+        metadata["returncode"] = result.returncode
+        if result.returncode == 0 and not unchanged:
+            result = subprocess.CompletedProcess(result.args, 1, result.stdout, (result.stderr or "") + "\nBuild inputs changed during compilation")
+        if metadata["status"] == "success":
+            for hap in sorted((project_dir / "entry/build").rglob("*.hap")):
+                if "outputs" in hap.parts and hap.is_file():
+                    relative = hap.relative_to(project_dir).as_posix()
+                    digest = content_hash(hap.read_bytes())
+                    fresh = hap.stat().st_mtime >= started or before_artifacts.get(relative) != digest
+                    previously_proven = previous_artifacts.get(relative) == digest
+                    if fresh or previously_proven:
+                        metadata["artifacts"].append({"path": relative, "sha256": digest,
+                            "signed": "unsigned" not in hap.name.lower(),
+                            "origin": "current_build" if fresh else "verified_incremental"})
+            if not metadata["artifacts"]:
+                metadata["status"] = "failed"
+                metadata["error"] = "Build returned success but produced no HAP artifact"
+                result = subprocess.CompletedProcess(result.args, 1, result.stdout,
+                    (result.stderr or "") + "\nNo HAP artifact was produced")
+        return result
+    except BaseException as exc:
+        metadata.update(status="failed", error=type(exc).__name__,
+                        stop_reason=getattr(exc, "reason", type(exc).__name__))
+        raise
+    finally:
+        metadata["finished_at"] = time.time()
+        atomic_write_json(metadata_path, metadata)
 
 
 def run_hvigor_build(project_dir: str | Path, task: str = "assembleHap") -> bool:

@@ -109,10 +109,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
         result = replay(trace, harmony, page_pairs, cfg, args.out)
         save_json(result.to_dict(),
                   os.path.join(args.out, trace.trace_id, "result.json"))
-        if result.passed:
+        if result.passed and result.status == "PASS":
             n_pass += 1
     logger.info("回放完成：%d/%d 条轨迹通过 → %s", n_pass, len(traces), args.out)
-    return 0
+    return 0 if traces and n_pass == len(traces) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +167,9 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     logger.info("评估完成：\n  %s\n  %s", json_path, md_path)
 
     print("\n===== 汇总 =====")
-    for key in ("traces", "R_replay", "R_eq", "trace_pass_rate",
+    for key in ("traces", "R_replay", "R_eq_direct", "R_eq_policy",
+                "direct_verified_steps", "mediated_steps",
+                "external_recovery_failures", "trace_pass_rate",
                 "avg_norm_divergence_depth", "page_coverage_align_rate",
                 "widget_recall"):
         if key in metrics:

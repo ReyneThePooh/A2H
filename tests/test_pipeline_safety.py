@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from pipeline.build_fixer import BuildFixLoop, ErrorParser
+from pipeline.artifacts import validate_project_contract
 from pipeline.project_packager import (
     InvalidResourceNameError,
     ResourceConflictError,
@@ -172,3 +173,130 @@ def test_find_component_new_violations(tmp_path: Path):
 
 def test_find_component_new_violations_empty_project(tmp_path: Path):
     assert find_component_new_violations(tmp_path) == []
+
+
+def test_build_fix_context_includes_bounded_relative_dependency(tmp_path: Path):
+    pages = tmp_path / "entry/src/main/ets/pages"
+    pages.mkdir(parents=True)
+    caller = pages / "Caller.ets"
+    caller.write_text("import { Api } from './Api';\nexport class Caller {}\n", encoding="utf-8")
+    dependency = pages / "Api.ets"
+    dependency.write_text("export class Api { static call(value: number): void {} }\n", encoding="utf-8")
+
+    context = BuildFixLoop._local_dependency_context(caller, tmp_path)
+
+    assert "entry/src/main/ets/pages/Api.ets" in context
+    assert "static call(value: number)" in context
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_build_repair_replaces_complete_file_and_keeps_original_backup(tmp_path, monkeypatch, write_fails):
+    import run_control
+    root = tmp_path / "project"
+    source = root / "entry/src/main/ets/pages/Main.ets"
+    source.parent.mkdir(parents=True)
+    original = "class Main { value(): number { return 1; } }\r\n"
+    fixed = "class Main { value(): number { return 2; } }\n"
+    source.write_bytes(original.encode("utf-8"))
+    loop = BuildFixLoop(llm=object())
+    monkeypatch.setattr(loop, "_reflection_fix", lambda *a, **kw: fixed)
+    replace = run_control.os.replace
+    def replace_or_interrupt(src, dst):
+        if write_fails and Path(dst) == source:
+            raise OSError("interrupted before source replacement")
+        return replace(src, dst)
+    monkeypatch.setattr(run_control.os, "replace", replace_or_interrupt)
+    errors = [{"file": str(source), "line": 1, "message": "type error", "code": "TYPE_ERROR"}]
+    if write_fails:
+        with pytest.raises(OSError, match="interrupted"):
+            loop._fix_files(root, None, errors)
+    else:
+        loop._fix_files(root, None, errors)
+    assert source.read_bytes() == (original if write_fails else fixed).encode("utf-8")
+    backup = source.with_suffix(".ets.bak")
+    if write_fails:
+        assert not backup.exists()
+    else:
+        assert backup.read_bytes() == original.encode("utf-8")
+    assert not list(source.parent.glob(".run-tmp-*"))
+
+
+def test_build_repair_updates_sync_source_and_both_manifests(tmp_path, monkeypatch):
+    from test_artifact_contract import make_project
+
+    packaged, _ = make_project(tmp_path / "packaged")
+    generated, _ = make_project(tmp_path / "generated")
+    source = packaged / "entry/src/main/ets/pages/Renamed.ets"
+    sync_source = generated / "entry/src/main/ets/pages/Renamed.ets"
+    fixed = source.read_text(encoding="utf-8").replace(
+        "build() {}", "build() { Text('fixed') }"
+    )
+    loop = BuildFixLoop(llm=object())
+    monkeypatch.setattr(loop, "_reflection_fix", lambda *a, **kw: fixed)
+
+    loop._fix_files(packaged, generated, [{
+        "file": str(source), "line": 1, "message": "type error",
+        "code": "TYPE_ERROR",
+    }])
+
+    assert source.read_text(encoding="utf-8") == fixed
+    assert sync_source.read_text(encoding="utf-8") == fixed
+    assert validate_project_contract(packaged) == []
+    assert validate_project_contract(generated) == []
+
+
+def test_build_repair_sync_failure_rolls_back_both_projects(tmp_path, monkeypatch):
+    import run_control
+    from test_artifact_contract import make_project
+
+    packaged, _ = make_project(tmp_path / "packaged")
+    generated, _ = make_project(tmp_path / "generated")
+    source = packaged / "entry/src/main/ets/pages/Renamed.ets"
+    sync_source = generated / "entry/src/main/ets/pages/Renamed.ets"
+    before = source.read_bytes()
+    sync_before = sync_source.read_bytes()
+    packaged_manifest = (packaged / "translation_manifest.json").read_bytes()
+    generated_manifest = (generated / "translation_manifest.json").read_bytes()
+    fixed = source.read_text(encoding="utf-8").replace(
+        "build() {}", "build() { Text('fixed') }"
+    )
+    loop = BuildFixLoop(llm=object())
+    monkeypatch.setattr(loop, "_reflection_fix", lambda *a, **kw: fixed)
+    real_atomic_write = run_control.atomic_write
+
+    def fail_sync(path, data):
+        if Path(path).resolve() == sync_source.resolve():
+            raise OSError("injected sync failure")
+        return real_atomic_write(path, data)
+
+    monkeypatch.setattr(run_control, "atomic_write", fail_sync)
+
+    with pytest.raises(OSError, match="injected sync failure"):
+        loop._fix_files(packaged, generated, [{
+            "file": str(source), "line": 1, "message": "type error",
+            "code": "TYPE_ERROR",
+        }])
+
+    assert source.read_bytes() == before
+    assert sync_source.read_bytes() == sync_before
+    assert (packaged / "translation_manifest.json").read_bytes() == packaged_manifest
+    assert (generated / "translation_manifest.json").read_bytes() == generated_manifest
+
+
+def test_build_interrupt_is_not_masked_by_manifest_refresh(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from run_control import BudgetExceeded
+
+    loop = BuildFixLoop(llm=object())
+    monkeypatch.setattr(
+        loop, "_run_in_place",
+        Mock(side_effect=BudgetExceeded("build_budget")),
+    )
+    refresh = Mock(side_effect=OSError("manifest failure"))
+    monkeypatch.setattr(loop, "_refresh_manifests", refresh)
+
+    with pytest.raises(BudgetExceeded, match="build_budget"):
+        loop.run(tmp_path)
+
+    refresh.assert_not_called()

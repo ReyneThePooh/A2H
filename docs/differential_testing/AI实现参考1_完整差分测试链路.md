@@ -274,7 +274,7 @@ replay(trace, harmony: HarmonyAdapter, page_pairs) -> TraceResult
 
 ### 6.7 指标（metrics.py）
 
-按设计文档 §4.9 公式实现：R_replay、R_eq、轨迹通过率、归一化首分叉深度、页面覆盖对齐率、控件召回率（UNMAPPED 计数）、缺陷谱。输出 `report.json` 与人读的 `report.md`（含每条轨迹一行的明细表 + 汇总）。
+按设计文档 §4.9 公式实现：R_replay、R_eq_direct、R_eq_policy、轨迹通过率、归一化首分叉深度、页面覆盖对齐率、控件召回率（UNMAPPED 计数）、中介恢复计数与缺陷谱。输出 `report.json` 与人读的 `report.md`（含每条轨迹一行的明细表 + 汇总）。
 
 ## 7. CLI 设计（cli.py）
 

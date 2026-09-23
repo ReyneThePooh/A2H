@@ -3,13 +3,16 @@ import json
 
 import pytest
 
-from diff_tester.gate import RepairReport
+from test_artifact_contract import make_project
+from pipeline.artifacts import ArtifactContractError, validate_project_contract, write_artifact_manifest
 from pipeline.functional_fixer import FunctionalFixLoop
 from pipeline.gate_bridge import (
     build_page_pairs,
     build_unit_page_map,
     find_hap,
     page_for_activity,
+    prepare_workspace,
+    prepare_static_index,
     read_bundle_name,
     unit_ets_files,
 )
@@ -84,6 +87,124 @@ def test_build_page_pairs_preserves_manual_entries(plan_file, tmp_path):
     assert pairs[".ProfileActivity"] == "EntryAbility:pages/ProfilePage"
 
 
+def test_prepare_real_mapping_allows_entry_and_navigation_defects(tmp_path):
+    root, data = make_project(tmp_path, code=(
+        "@Entry\n@Component\nstruct Screen {\n"
+        "  open() { router.pushUrl({ url: 'pages/Missing' }) }\n"
+        "  build() { Text('weather') }\n}\n"))
+    main = root / "entry/src/main"
+    (main / "module.json5").write_text("{}", encoding="utf-8")
+    ability = main / "ets/entryability/EntryAbility.ets"
+    ability.parent.mkdir()
+    ability.write_text("windowStage.loadContent('pages/Wrong');", encoding="utf-8")
+    registration = main / "resources/base/profile/main_pages.json"
+    registration.parent.mkdir(parents=True)
+    registration.write_text(json.dumps({"src": ["pages/Renamed"]}), encoding="utf-8")
+    issues = {issue["code"] for issue in validate_project_contract(root)}
+    assert {"CONTRACT_ENTRY", "CONTRACT_NAVIGATION"} <= issues
+    original = ability.read_bytes()
+    workspace = tmp_path / "gate"
+
+    prepare_workspace(workspace, None, project_dir=root)
+
+    pairs = json.loads((workspace / "page_pairs.json").read_text(encoding="utf-8"))
+    mapping = json.loads((workspace / "unit_page_map.json").read_text(encoding="utf-8"))
+    assert pairs["example.Start"] == "EntryAbility:pages/Renamed"
+    assert mapping["screen"]["unit_id"] == data["units"][0]["unit_id"]
+    assert ability.read_bytes() == original
+
+
+def test_prepare_static_index_persists_index_and_blocks_dangling_route(tmp_path):
+    root, _ = make_project(
+        tmp_path,
+        code=("@Entry\n@Component\nstruct Screen {\n"
+              "  open() { router.pushUrl({ url: 'pages/Missing' }) }\n"
+              "  build() {}\n}\n"),
+    )
+    workspace = tmp_path / "gate"
+
+    with pytest.raises(RuntimeError, match="STATIC_CONTRACT_INVALID"):
+        prepare_static_index(root, workspace)
+
+    assert (workspace / "arkts_index.json").is_file()
+    issues = json.loads((workspace / "arkts_static_issues.json").read_text())
+    assert any(item["code"] == "UNREGISTERED_ROUTE" for item in issues["issues"])
+
+
+@pytest.mark.parametrize("failure", ["missing", "escape"])
+def test_prepare_rejects_missing_or_escaping_page_output(tmp_path, failure):
+    root, data = make_project(tmp_path)
+    if failure == "missing":
+        (root / data["pages"][0]["output"]).unlink()
+    else:
+        (tmp_path / "outside.ets").write_text("@Entry struct Outside {}", encoding="utf-8")
+        data["pages"][0]["output"] = "../outside.ets"
+        write_artifact_manifest(root, data)
+    workspace = tmp_path / "gate"
+
+    with pytest.raises((RuntimeError, ArtifactContractError),
+                       match="PAGE_MAPPING_INVALID|Unsafe artifact path"):
+        prepare_workspace(workspace, None, project_dir=root)
+
+    assert not (workspace / "page_pairs.json").exists()
+    assert not (workspace / "unit_page_map.json").exists()
+
+
+def test_prepare_legacy_mapping_reuses_explicit_files_unchanged(tmp_path):
+    root = tmp_path / "legacy"
+    page = root / "entry/src/main/ets/pages/Actual.ets"
+    page.parent.mkdir(parents=True)
+    page.write_text("@Entry struct Actual {}", encoding="utf-8")
+    workspace = tmp_path / "gate"
+    workspace.mkdir()
+    originals = {
+        "page_pairs.json": b'{ "example.Start": "EntryAbility:pages/Actual" }\n',
+        "unit_page_map.json": (b'{ "screen": {"android_pages":["example.Start"],'
+                               b'"harmony_pages":["EntryAbility:pages/Actual"]} }\n'),
+    }
+    for name, content in originals.items():
+        (workspace / name).write_bytes(content)
+    stale_plan = tmp_path / "plan.json"
+    stale_plan.write_text("broken stale plan", encoding="utf-8")
+
+    prepare_workspace(workspace, stale_plan, project_dir=root)
+
+    assert {name: (workspace / name).read_bytes() for name in originals} == originals
+
+
+def test_prepare_legacy_plan_alone_does_not_guess_page_mapping(tmp_path, plan_file):
+    root = tmp_path / "legacy"
+    root.mkdir()
+    workspace = tmp_path / "gate"
+
+    with pytest.raises(RuntimeError, match="PAGE_MAPPING_MISSING"):
+        prepare_workspace(workspace, plan_file, project_dir=root)
+
+    assert not (workspace / "page_pairs.json").exists()
+    assert not (workspace / "unit_page_map.json").exists()
+
+
+@pytest.mark.parametrize("conflicting_file", ["page_pairs.json", "unit_page_map.json"])
+def test_prepare_conflicting_mapping_stops_without_overwriting_files(tmp_path, conflicting_file):
+    root, _ = make_project(tmp_path)
+    workspace = tmp_path / "gate"
+    prepare_workspace(workspace, None, project_dir=root)
+    path = workspace / conflicting_file
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if conflicting_file == "page_pairs.json":
+        data["example.Start"] = "EntryAbility:pages/ManualChoice"
+    else:
+        data["screen"]["harmony_pages"] = ["EntryAbility:pages/ManualChoice"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    originals = {name: (workspace / name).read_bytes()
+                 for name in ("page_pairs.json", "unit_page_map.json")}
+
+    with pytest.raises(RuntimeError, match="PAGE_MAPPING_CONFLICT"):
+        prepare_workspace(workspace, None, project_dir=root)
+
+    assert {name: (workspace / name).read_bytes() for name in originals} == originals
+
+
 # ---------------------------------------------------------------------------
 # 工程侧信息
 # ---------------------------------------------------------------------------
@@ -127,25 +248,6 @@ def test_unit_ets_files(tmp_path):
 # functional_fixer（不触网）
 # ---------------------------------------------------------------------------
 
-def _report(trace_id="t1", failure_type="CONTENT_LOSS", suspect_units=None):
-    return RepairReport(
-        trace_id=trace_id, trace_intent="测试", diverged_step=1,
-        failure_type=failure_type, abstract_event={}, expected={}, actual={},
-        suspect_units=suspect_units or [],
-    )
-
-
-def test_next_units_union_and_fallback():
-    r1 = _report("t1", suspect_units=["Unit_A"])
-    r2 = _report("t2", suspect_units=["Unit_B", "Unit_A"])
-    assert FunctionalFixLoop._next_units([r1, r2]) == ["Unit_A", "Unit_B"]
-
-    # 任一报告缺 suspect_units → 全量（None）
-    assert FunctionalFixLoop._next_units([r1, _report("t3")]) is None
-    # 只有 TIMEOUT → 无可增量选择 → 全量
-    assert FunctionalFixLoop._next_units([_report("t4", failure_type="TIMEOUT")]) is None
-
-
 class FakeLLM:
     """返回固定修复代码的假 LLM。"""
 
@@ -158,7 +260,7 @@ class FakeLLM:
         return self.response
 
 
-def test_fix_file_writes_backup_and_diff(tmp_path):
+def test_fix_file_proposes_before_batch_commit_writes_backup_and_diff(tmp_path):
     fp = tmp_path / "MainPage.ets"
     source = ("@Entry\n@Component\nstruct MainPage {\n"
               "  build() {\n    Text('旧')\n  }\n}\n")
@@ -171,6 +273,14 @@ def test_fix_file_writes_backup_and_diff(tmp_path):
 
     diff = loop._fix_file(fp, "## 报告", "")
     assert diff and "-    Text('旧')" in diff and "+    Text('新')" in diff
+    assert fp.read_text(encoding="utf-8") == source
+    assert not fp.with_suffix(".ets.funcbak").exists()
+
+    loop._commit_file_repairs(
+        tmp_path.resolve(), None, None,
+        [(fp.resolve(), loop._last_file_repair_outcome)],
+    )
+
     assert fp.read_text(encoding="utf-8").rstrip() == fixed_code.rstrip()
     # 首次修复保留原文备份
     backup = fp.with_suffix(".ets.funcbak")

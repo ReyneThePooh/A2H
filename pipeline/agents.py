@@ -13,6 +13,7 @@
 """
 
 import os
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -20,6 +21,7 @@ from typing import Any, Optional
 from hello_agents.core.exceptions import HelloAgentsException
 from hello_agents.core.llm import HelloAgentsLLM
 from hello_agents.agents.function_call_agent import FunctionCallAgent
+from run_control import BudgetExceeded, check_budget, consume_budget, remaining_timeout
 
 
 # ============================================================
@@ -27,30 +29,76 @@ from hello_agents.agents.function_call_agent import FunctionCallAgent
 # ============================================================
 
 #: 判定为"可重试的瞬态错误"的关键词（匹配异常消息，忽略大小写）
-_TRANSIENT_PATTERNS = ("connection", "timed out", "timeout", "429",
-                       "rate limit", "502", "503", "504", "524",
-                       "temporarily")
 _MAX_ATTEMPTS = 3        # 总尝试次数（首次 + 2 次重试）
 _BASE_DELAY_S = 2.0      # 指数退避基数：2s → 4s
 
 
+class LLMCallError(HelloAgentsException):
+    """Typed, redacted transport/protocol failure; never a NO_CHANGE result."""
+    def __init__(self, reason, *, retryable=False, status_code=None):
+        self.reason = reason
+        self.retryable = retryable
+        self.status_code = status_code
+        super().__init__(f"LLM {reason}" + (f" (HTTP {status_code})" if status_code else ""))
+
+
+class IncompleteResponseError(LLMCallError):
+    def __init__(self, reason="incomplete_response", *, retryable=True):
+        super().__init__(reason, retryable=retryable)
+
+
+def _classify_llm_error(exc):
+    if isinstance(exc, (BudgetExceeded, LLMCallError)):
+        return exc
+    status = getattr(exc, "status_code", None)
+    names = {kind.__name__ for kind in type(exc).__mro__}
+    if status in (401, 403):
+        return LLMCallError("authentication", status_code=status)
+    if status == 429 or (isinstance(status, int) and status >= 500):
+        return LLMCallError("transient_http", retryable=True, status_code=status)
+    message = str(exc).lower()
+    if (names & {"APIError"} and any(marker in message for marker in
+            ("stream was interrupted", "response stream was interrupted", "connection reset"))):
+        return LLMCallError("transport", retryable=True)
+    if names & {"TimeoutError", "APITimeoutError", "ReadTimeout", "ConnectTimeout",
+                "APIConnectionError", "ConnectionError", "ConnectError", "ReadError",
+                "RemoteProtocolError"}:
+        return LLMCallError("transport", retryable=True)
+    # Some OpenAI-compatible gateways drop the response before the SDK can
+    # attach a status code. Retry those ambiguous failures, but do not retry
+    # an explicit client-side 4xx error such as an invalid request.
+    return LLMCallError("request_failed", retryable=status is None, status_code=status)
+
+
 def _is_transient(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(p in msg for p in _TRANSIENT_PATTERNS)
+    return bool(getattr(_classify_llm_error(exc), "retryable", False))
 
 
 def _retry_transient(fn, what: str):
     """执行 fn()；瞬态网络错误指数退避重试，非瞬态错误（如鉴权失败）立即抛出。"""
     for attempt in range(1, _MAX_ATTEMPTS + 1):
+        check_budget()
         try:
             return fn()
+        except BudgetExceeded:
+            raise
         except Exception as e:
-            if attempt == _MAX_ATTEMPTS or not _is_transient(e):
-                raise
+            failure = _classify_llm_error(e)
+            if attempt == _MAX_ATTEMPTS or not failure.retryable:
+                if failure is e:
+                    raise
+                raise failure from e
             delay = _BASE_DELAY_S * (2 ** (attempt - 1))
             print(f"      ⏳ {what}瞬态错误，{delay:.0f}s 后重试"
-                  f"（{attempt}/{_MAX_ATTEMPTS - 1}）: {str(e)[:80]}")
-            time.sleep(delay)
+                  f"（{attempt}/{_MAX_ATTEMPTS - 1}）: {failure.reason}")
+            time.sleep(remaining_timeout(delay))
+            check_budget()
+
+
+def _request_client(llm, timeout):
+    # Disable SDK retries so every network attempt is visible to our budget.
+    client = llm._client
+    return client.with_options(max_retries=0, timeout=timeout) if hasattr(client, "with_options") else client
 
 
 class RetryingLLM(HelloAgentsLLM):
@@ -62,22 +110,44 @@ class RetryingLLM(HelloAgentsLLM):
     """
 
     def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
-        return _retry_transient(
-            lambda: self._invoke_stream(messages, **kwargs),
-            "LLM 调用",
-        )
+        try:
+            return _retry_transient(
+                lambda: self._invoke_stream(messages, **kwargs),
+                "LLM 调用",
+            )
+        except IncompleteResponseError as exc:
+            if exc.reason != "finish_missing":
+                raise
+            # Some OpenAI-compatible gateways omit the terminal chunk in
+            # streaming mode. A validated non-stream response is safer than
+            # accepting possibly truncated streamed source code.
+            print("      ⚠️ 流式响应缺少结束标记，改用非流式请求兜底", flush=True)
+            return _retry_transient(
+                lambda: self._invoke_nonstream(messages, **kwargs),
+                "LLM 非流式兜底",
+            )
 
     def _invoke_stream(self, messages: list[dict[str, str]], **kwargs) -> str:
+        consume_budget("llm_calls")
+        timeout = remaining_timeout(float(kwargs.get("timeout", self.timeout)))
+        response = None
         try:
-            response = self._client.chat.completions.create(
+            options = dict(kwargs)
+            options.pop("timeout", None)
+            options.pop("stream", None)
+            options.setdefault("temperature", self.temperature)
+            options.setdefault("max_tokens", self.max_tokens)
+            response = _request_client(self, timeout).chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=kwargs.get("temperature", self.temperature),
-                max_tokens=kwargs.get("max_tokens", self.max_tokens),
                 stream=True,
+                timeout=timeout,
+                **options,
             )
             parts: list[str] = []
+            finish_reason = None
             for chunk in response:
+                check_budget()
                 choices = getattr(chunk, "choices", None) or []
                 if not choices:
                     continue
@@ -85,11 +155,82 @@ class RetryingLLM(HelloAgentsLLM):
                 text = getattr(delta, "content", None) if delta else None
                 if text:
                     parts.append(text)
-            return "".join(parts)
-        except HelloAgentsException:
+                if getattr(delta, "refusal", None):
+                    raise LLMCallError("refusal")
+                reason = getattr(choices[0], "finish_reason", None)
+                if reason:
+                    finish_reason = reason
+            check_budget()
+            if finish_reason == "content_filter":
+                raise LLMCallError("content_filter")
+            if finish_reason != "stop":
+                reason = f"finish_{finish_reason or 'missing'}"
+                # A cleanly closed stream without its terminal event is often
+                # a gateway protocol incompatibility. Let invoke() switch to
+                # its validated non-stream fallback immediately.
+                raise IncompleteResponseError(reason, retryable=reason != "finish_missing")
+            result = "".join(parts)
+            if not result.strip():
+                raise IncompleteResponseError("empty_response")
+            return result
+        except (BudgetExceeded, LLMCallError):
             raise
         except Exception as e:
-            raise HelloAgentsException(f"LLM调用失败: {e}") from e
+            raise _classify_llm_error(e) from e
+        finally:
+            if response is not None and hasattr(response, "close"):
+                try:
+                    response.close()
+                except Exception:
+                    pass  # Cleanup must not hide a typed failure or budget stop.
+
+    def _invoke_nonstream(self, messages: list[dict[str, str]], **kwargs) -> str:
+        consume_budget("llm_calls")
+        timeout = remaining_timeout(float(kwargs.get("timeout", self.timeout)))
+        try:
+            options = dict(kwargs)
+            options.pop("timeout", None)
+            options.pop("stream", None)
+            options.setdefault("temperature", self.temperature)
+            options.setdefault("max_tokens", self.max_tokens)
+            response = _request_client(self, timeout).chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=False,
+                timeout=timeout,
+                **options,
+            )
+            check_budget()
+            if isinstance(response, str):
+                lowered = response.lstrip().lower()
+                if lowered.startswith("<!doctype html") or lowered.startswith("<html"):
+                    raise LLMCallError("gateway_html_response")
+                raise LLMCallError("invalid_response_format")
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise IncompleteResponseError("empty_choices")
+            choice = choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            if finish_reason == "content_filter":
+                raise LLMCallError("content_filter")
+            if finish_reason != "stop":
+                raise IncompleteResponseError(f"finish_{finish_reason or 'missing'}")
+            content = getattr(getattr(choice, "message", None), "content", None)
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+                    if text:
+                        parts.append(text)
+                content = "".join(parts)
+            result = content if isinstance(content, str) else (str(content) if content is not None else "")
+            if not result.strip():
+                raise IncompleteResponseError("empty_response")
+            return result
+        except (BudgetExceeded, LLMCallError):
+            raise
+        except Exception as e:
+            raise _classify_llm_error(e) from e
 
 
 # ============================================================
@@ -205,11 +346,39 @@ class PipelineAgent(FunctionCallAgent):
 
     def _invoke_with_tools(self, messages, tools, tool_choice, **kwargs):
         # 带工具的调用绕过 llm.invoke 直连 OpenAI 客户端，须在此补瞬态重试
-        return _retry_transient(
-            lambda: super(PipelineAgent, self)._invoke_with_tools(
-                messages, tools, tool_choice, **kwargs),
-            "LLM 工具调用",
-        )
+        def attempt():
+            consume_budget("llm_calls")
+            options = dict(kwargs)
+            timeout = remaining_timeout(float(options.pop("timeout", self.llm.timeout)))
+            options.setdefault("temperature", self.llm.temperature)
+            if self.llm.max_tokens is not None:
+                options.setdefault("max_tokens", self.llm.max_tokens)
+            response = _request_client(self.llm, timeout).chat.completions.create(
+                model=self.llm.model, messages=messages, tools=tools,
+                tool_choice=tool_choice, timeout=timeout, **options)
+            check_budget()
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise IncompleteResponseError("empty_choices")
+            choice = choices[0]
+            reason = getattr(choice, "finish_reason", None)
+            if reason == "content_filter":
+                raise LLMCallError("content_filter")
+            if reason not in ("stop", "tool_calls"):
+                raise IncompleteResponseError(f"finish_{reason or 'missing'}")
+            message = choice.message
+            calls = getattr(message, "tool_calls", None) or []
+            if not calls and not self._extract_message_content(message.content).strip():
+                raise IncompleteResponseError("empty_response")
+            for call in calls:
+                try:
+                    parsed = json.loads(call.function.arguments)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("object required")
+                except (ValueError, TypeError):
+                    raise IncompleteResponseError("invalid_tool_arguments")
+            return response
+        return _retry_transient(attempt, "LLM 工具调用")
 
 
 # ============================================================
@@ -323,6 +492,11 @@ class TranslationPlanAgent(PipelineAgent):
 - get_file_summary(文件名): 查看文件详细摘要（方法签名、行号、字段、资源引用等）
 
 ## 决策规则
+
+### 输出依赖
+- depends_on 使用准确的 .ets 文件名：可以引用依赖上下文中已生成的文件，也可以引用本次 outputs 中的其他文件。
+- 不得依赖自己、未声明的文件或臆测的文件名。order 按依赖先于使用者排列。
+- 本次源文件可能包含一组循环依赖的单元，必须整体规划并覆盖所有源码。页面间跳转使用路由；共享数据/接口提取为基础模块，避免输出文件之间循环依赖。
 
 ### 简单文件 → type="simple", plan 为空
 - 单文件 Java（工具类/数据模型），无关联 XML，行数 < 200

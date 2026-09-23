@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+from run_control import BudgetExceeded, check_budget
 from typing import TYPE_CHECKING, Optional
 
 from .config import Config
@@ -108,8 +109,12 @@ def attribute_all(
     patterns = load_whitelist(cfg.whitelist_path)
 
     for result in results:
+        check_budget()
         report = result.divergence
         if report is None:
+            continue
+        if result.status in ("INCONCLUSIVE", "NOT_RUN") or report.cause_class != "translation":
+            report.detail["attribution_note"] = "运行或基线证据不足，不归类为翻译缺陷"
             continue
         report.detail["defect_type"] = KIND_TO_DEFECT_TYPE.get(report.kind, "unknown")
 
@@ -125,6 +130,7 @@ def attribute_all(
         # 1) 鸿蒙端复跑 confirm_runs 次
         reproduced = 0
         for i in range(confirm_runs):
+            check_budget()
             rerun_dir = os.path.join(tmp_root, f"{report.trace_id}_confirm{i}")
             r = replay(trace, harmony, page_pairs, cfg, rerun_dir,
                        collect_artifacts=False)
@@ -174,6 +180,8 @@ def _android_self_check(trace: Trace, android: "AndroidAdapter",
             if android.poll_crash() or not android.app_alive():
                 return True
         return False
+    except BudgetExceeded:
+        raise
     except Exception as e:
         logger.warning("[attribute] 安卓自复跑异常: %s", e)
         return True

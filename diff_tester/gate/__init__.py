@@ -9,8 +9,16 @@ schemas），只做子集编排：固定种子轨迹回放 + L0–L2 预言 + �
 """
 from .flaky import FlakyList
 from .gate_runner import GateRequest, GateResult, run_gate
-from .repair_report import RepairReport, build_repair_report
-from .selector import GLOBAL_UNIT, select_traces, trace_pages
+from .repair_report import (RepairReport, build_repair_report,
+                            build_repair_reports, cluster_reports)
+from .selector import (
+    GLOBAL_UNIT,
+    filter_traces_by_max_steps,
+    select_shortest_cover,
+    select_traces,
+    trace_pages,
+    trace_step_count,
+)
 
 __all__ = [
     "FlakyList",
@@ -19,7 +27,12 @@ __all__ = [
     "run_gate",
     "RepairReport",
     "build_repair_report",
+    "build_repair_reports",
+    "cluster_reports",
     "GLOBAL_UNIT",
+    "filter_traces_by_max_steps",
+    "select_shortest_cover",
     "select_traces",
     "trace_pages",
+    "trace_step_count",
 ]

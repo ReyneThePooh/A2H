@@ -45,6 +45,43 @@ def test_id_preserved_matched():
     assert m.score > 0.9
 
 
+def test_unique_exact_id_survives_cross_platform_layout_and_role_drift():
+    tree = mk_tree(
+        mk_node("image", id="btn_back", rb=(0.44, 0.05, 0.58, 0.06)),
+        mk_node("button", id="other", rb=(0.01, 0.06, 0.13, 0.11)),
+    )
+
+    m = match(
+        fp(id_hint="btn_back", rb=(0.01, 0.06, 0.13, 0.11)),
+        tree,
+        "CLICK",
+        CFG,
+    )
+
+    assert m.kind == "MATCHED"
+    assert m.node.id == "btn_back"
+    assert m.score == 1.0
+    assert m.detail["strategy"] == "unique_exact_id"
+    assert m.detail["top"][0]["components"]["role"] == 1.0
+
+
+def test_duplicate_exact_ids_still_require_similarity_disambiguation():
+    tree = mk_tree(
+        mk_node("button", id="row_action", rb=(0.1, 0.2, 0.9, 0.3)),
+        mk_node("button", id="row_action", rb=(0.1, 0.7, 0.9, 0.8)),
+    )
+
+    m = match(
+        fp(id_hint="row_action", rb=(0.1, 0.45, 0.9, 0.55)),
+        tree,
+        "CLICK",
+        CFG,
+    )
+
+    assert m.kind == "AMBIGUOUS"
+    assert m.detail["strategy"] == "weighted_similarity"
+
+
 # ---------------------------------------------------------------------------
 # 情形 2：id 丢失 → 权重按比例摊给 text/role/pos，仍可匹配
 # ---------------------------------------------------------------------------

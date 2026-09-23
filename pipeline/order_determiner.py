@@ -4,6 +4,7 @@ import os
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
+from run_control import BudgetExceeded, check_budget
 
 from hello_agents.core.llm import HelloAgentsLLM
 
@@ -16,11 +17,12 @@ from analyzers.static import (
 from analyzers.tools import ToolRegistry, _summary_to_dict
 from pipeline.static_graph import (
     norm_path, build_file_graph, build_hard_groups,
-    layered_topological_sort, validate_plan, export_artifacts,
+    layered_topological_sort, tarjan_scc, validate_plan, export_artifacts,
 )
 from pipeline.agents import (
     create_pipeline_llm, UnitBuildAgent, DependencyReviewAgent,
 )
+from pipeline.artifacts import ArtifactContractError, atomic_write_json, content_hash
 
 
 # ============================================================
@@ -52,8 +54,8 @@ def scan_project(project_path: str, src_dir: str = "app/src/main") -> dict[str, 
             rel = norm_path(f.relative_to(root))
             try:
                 files[rel] = f.read_text(encoding='utf-8')
-            except Exception:
-                pass
+            except (OSError, UnicodeError) as exc:
+                raise ArtifactContractError(f"Unreadable source file: {f}") from exc
 
     # 只保留 .java 和 layout 目录下的 .xml
     filtered = {}
@@ -82,33 +84,49 @@ class SummaryGenerator:
         """生成所有文件摘要，优先从缓存加载"""
         summaries = {}
 
-        # 尝试加载缓存
+        fingerprint_path = Path(cache_path + ".fingerprints.json") if cache_path else None
+        fingerprint_context = {"schema": 2, "model": os.getenv("LLM_MODEL_ID", ""),
+                               "analyzer": content_hash(Path(__file__).read_bytes()),
+                               "static_analyzer": content_hash((Path(__file__).parent.parent / "analyzers/static.py").read_bytes())}
+        fingerprints = {path: content_hash(json.dumps(fingerprint_context, sort_keys=True) + "\n" + code)
+                        for path, code in files.items()}
+        old_fingerprints = {}
+        if fingerprint_path:
+            try:
+                old_fingerprints = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        # Cache only unchanged files; additions/deletions and dependency analysis
+        # always see the current source inventory.
         if cache_path and os.path.exists(cache_path):
             cached = self._load_cache(cache_path)
             if cached:
-                # 旧缓存可能缺少新增的静态字段（type_references 等），用零 token 的静态分析补齐
-                if self._refresh_static_fields(cached, files):
-                    self._save_cache(cached, cache_path)
-                return cached
+                summaries = {path: summary for path, summary in cached.items()
+                             if path in fingerprints and old_fingerprints.get(path) == fingerprints[path]}
+        reused = set(summaries)
 
         # 第一阶段：静态分析（零 token）
         for file_path, code in files.items():
+            if file_path in reused:
+                continue
             s = analyze_file(file_path, code)
             if s:
                 summaries[file_path] = s
 
         # 第二阶段：LLM 补充语义摘要
-        java_files = [(p, s) for p, s in summaries.items() if isinstance(s, FileSummary)]
-        xml_files = [(p, s) for p, s in summaries.items() if isinstance(s, XmlSummary)]
+        java_files = [(p, s) for p, s in summaries.items() if isinstance(s, FileSummary) and p not in reused]
+        xml_files = [(p, s) for p, s in summaries.items() if isinstance(s, XmlSummary) and p not in reused]
 
         print(f"  静态分析完成: {len(java_files)} Java, {len(xml_files)} XML")
         print(f"  LLM 语义摘要生成中...")
 
         for i, (file_path, s) in enumerate(java_files):
+            check_budget()
             print(f"    [{i + 1}/{len(java_files)}] {Path(file_path).name}")
             self._summarize_java(file_path, s)
 
         for i, (file_path, s) in enumerate(xml_files):
+            check_budget()
             if s.is_empty():
                 continue
             print(f"    [{i + 1}/{len(xml_files)}] {Path(file_path).name}")
@@ -117,6 +135,7 @@ class SummaryGenerator:
         # 保存缓存
         if cache_path:
             self._save_cache(summaries, cache_path)
+            atomic_write_json(fingerprint_path, fingerprints)
 
         return summaries
 
@@ -175,33 +194,38 @@ class SummaryGenerator:
         try:
             result = self.llm.invoke([{"role": "user", "content": prompt}])
             data = self._parse_json(result)
-            if data:
-                s.class_purpose = data.get("class_purpose", "")
-                s.class_role = data.get("class_role", "")
-                s.design_pattern = data.get("design_pattern", "")
-                s.is_stateful = data.get("is_stateful", False)
-                s.lifecycle_dependent = data.get("lifecycle_dependent", False)
-                s.call_flow = data.get("call_flow", "")
+            if not isinstance(data, dict):
+                raise ValueError("semantic summary is not a JSON object")
+            if not isinstance(data.get("methods", []), list) or not isinstance(data.get("fields", []), list):
+                raise ValueError("semantic summary methods/fields must be arrays")
+            s.class_purpose = data.get("class_purpose", "")
+            s.class_role = data.get("class_role", "")
+            s.design_pattern = data.get("design_pattern", "")
+            s.is_stateful = data.get("is_stateful", False)
+            s.lifecycle_dependent = data.get("lifecycle_dependent", False)
+            s.call_flow = data.get("call_flow", "")
 
-                # 填充方法语义
-                llm_methods = {m["name"]: m for m in data.get("methods", [])}
-                for m in s.methods:
-                    lm = llm_methods.get(m.name, {})
-                    m.purpose = lm.get("purpose", "")
-                    for p in m.params:
-                        lp_map = {pp["name"]: pp for pp in lm.get("params", [])}
-                        p.purpose = lp_map.get(p.name, {}).get("purpose", "")
-                    if m.returns and lm.get("returns"):
-                        m.returns.meaning = lm["returns"].get("meaning", "")
-                    m.side_effects = lm.get("side_effects", [])
+            # 填充方法语义
+            llm_methods = {m["name"]: m for m in data.get("methods", [])}
+            for m in s.methods:
+                lm = llm_methods.get(m.name, {})
+                m.purpose = lm.get("purpose", "")
+                for p in m.params:
+                    lp_map = {pp["name"]: pp for pp in lm.get("params", [])}
+                    p.purpose = lp_map.get(p.name, {}).get("purpose", "")
+                if m.returns and lm.get("returns"):
+                    m.returns.meaning = lm["returns"].get("meaning", "")
+                m.side_effects = lm.get("side_effects", [])
 
-                # 填充字段语义
-                llm_fields = {f["name"]: f for f in data.get("fields", [])}
-                for f in s.fields:
-                    lf = llm_fields.get(f.name, {})
-                    f.purpose = lf.get("purpose", "")
+            # 填充字段语义
+            llm_fields = {f["name"]: f for f in data.get("fields", [])}
+            for f in s.fields:
+                lf = llm_fields.get(f.name, {})
+                f.purpose = lf.get("purpose", "")
+        except BudgetExceeded:
+            raise
         except Exception as e:
-            print(f"      ⚠️ LLM 摘要生成失败: {e}")
+            raise ArtifactContractError(f"Semantic summary failed for {file_path}: {e}") from e
 
     def _summarize_xml(self, file_path: str, s: XmlSummary):
         """LLM 为 XML 布局生成语义摘要"""
@@ -233,14 +257,17 @@ class SummaryGenerator:
         try:
             result = self.llm.invoke([{"role": "user", "content": prompt}])
             data = self._parse_json(result)
-            if data:
-                s.purpose = data.get("purpose", "")
-                s.layout_pattern = data.get("layout_pattern", "")
-                s.hierarchy = data.get("hierarchy", "")
-                s.data_binding = data.get("data_binding", [])
-                s.event_handling = data.get("event_handling", [])
+            if not isinstance(data, dict):
+                raise ValueError("layout summary is not a JSON object")
+            s.purpose = data.get("purpose", "")
+            s.layout_pattern = data.get("layout_pattern", "")
+            s.hierarchy = data.get("hierarchy", "")
+            s.data_binding = data.get("data_binding", [])
+            s.event_handling = data.get("event_handling", [])
+        except BudgetExceeded:
+            raise
         except Exception as e:
-            print(f"      ⚠️ LLM 摘要生成失败: {e}")
+            raise ArtifactContractError(f"Semantic summary failed for {file_path}: {e}") from e
 
     @staticmethod
     def _refresh_static_fields(summaries: dict, files: dict[str, str]) -> bool:
@@ -328,8 +355,7 @@ class SummaryGenerator:
                 data[path] = {"type": "xml", "data": _to_dict(s)}
 
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_write_json(Path(cache_path), data)
         print(f"  摘要缓存已保存: {cache_path}")
 
     def _load_cache(self, cache_path: str) -> dict | None:
@@ -662,6 +688,8 @@ class UnitDependencyAnalyzer:
                     print(f"  LLM 分析: {reasoning}")
             else:
                 print(f"  ⚠️ LLM 输出 JSON 解析失败，保留静态依赖结果")
+        except BudgetExceeded:
+            raise
         except Exception as e:
             print(f"  ⚠️ LLM 依赖分析失败: {e}，保留静态依赖结果")
 
@@ -671,6 +699,34 @@ class UnitDependencyAnalyzer:
 # ============================================================
 # 步骤 5: 拓扑排序
 # ============================================================
+
+def merge_cyclic_units(units: list[Unit], deps: dict[str, set[str]]) -> tuple[list[Unit], dict[str, set[str]]]:
+    """Collapse mutually dependent units into one translation task, retaining all sources."""
+    by_name = {unit.name: unit for unit in units}
+    if len(by_name) != len(units):
+        raise ArtifactContractError("Translation unit names must be unique")
+    for name, targets in deps.items():
+        if name not in by_name or not targets.issubset(by_name):
+            raise ArtifactContractError(f"Unknown translation dependencies: {name} -> {sorted(targets)}")
+    groups, owner = [], {}
+    for members in tarjan_scc(list(by_name), deps):
+        if len(members) == 1:
+            group = by_name[members[0]]
+        else:
+            name = "联合翻译[" + "、".join(members) + "]"
+            if name in by_name:
+                raise ArtifactContractError(f"Translation group name collision: {name}")
+            group = Unit(name,
+                         sorted({source for member in members for source in by_name[member].sources}),
+                         "\n".join(f"{member}: {by_name[member].description}" for member in members))
+            print(f"  循环依赖合并翻译: {members}")
+        groups.append(group)
+        owner.update({member: group.name for member in members})
+    grouped_deps = {group.name: set() for group in groups}
+    for name, targets in deps.items():
+        grouped_deps[owner[name]].update(owner[target] for target in targets if owner[target] != owner[name])
+    return groups, grouped_deps
+
 
 def topological_sort(
     units: list[Unit], deps: dict[str, set[str]]
@@ -792,6 +848,9 @@ class OrderDeterminer:
             self.cache_dir, units, file_graph, hard_groups,
             unit_deps, layers, cycles, violations,
         )
+
+        if violations:
+            raise ArtifactContractError("Translation plan validation failed: " + "; ".join(map(str, violations)))
 
         return layers, unit_deps
 
