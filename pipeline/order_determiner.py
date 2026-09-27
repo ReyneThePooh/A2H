@@ -2,6 +2,7 @@
 
 import os
 import json
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from run_control import BudgetExceeded, check_budget
@@ -193,7 +194,14 @@ class SummaryGenerator:
 
         try:
             result = self.llm.invoke([{"role": "user", "content": prompt}])
-            data = self._parse_json(result)
+            data = self._parse_object(result)
+            if not isinstance(data, dict):
+                repair_prompt = (
+                    f"{prompt}\n\n上一次响应不是可用的 JSON 对象。"
+                    "请重新输出一个且仅一个 JSON 对象，不要数组、Markdown、工具参数或额外说明。"
+                )
+                result = self.llm.invoke([{"role": "user", "content": repair_prompt}])
+                data = self._parse_object(result)
             if not isinstance(data, dict):
                 raise ValueError("semantic summary is not a JSON object")
             if not isinstance(data.get("methods", []), list) or not isinstance(data.get("fields", []), list):
@@ -256,7 +264,14 @@ class SummaryGenerator:
 
         try:
             result = self.llm.invoke([{"role": "user", "content": prompt}])
-            data = self._parse_json(result)
+            data = self._parse_object(result)
+            if not isinstance(data, dict):
+                repair_prompt = (
+                    f"{prompt}\n\n上一次响应不是可用的 JSON 对象。"
+                    "请重新输出一个且仅一个 JSON 对象，不要数组、Markdown、工具参数或额外说明。"
+                )
+                result = self.llm.invoke([{"role": "user", "content": repair_prompt}])
+                data = self._parse_object(result)
             if not isinstance(data, dict):
                 raise ValueError("layout summary is not a JSON object")
             s.purpose = data.get("purpose", "")
@@ -325,6 +340,69 @@ class SummaryGenerator:
                 except json.JSONDecodeError:
                     pass
             return None
+
+    @staticmethod
+    def _parse_object(text: str) -> dict | None:
+        """Parse one summary object while tolerating known gateway wrappers."""
+        if not isinstance(text, str) or not text.strip():
+            return None
+
+        payload = text.strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", payload, re.I)
+        if fenced:
+            payload = fenced.group(1).strip()
+
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+            return data[0]
+
+        decoder = json.JSONDecoder()
+        values = []
+        offset = payload.find("{")
+        if offset < 0:
+            offset = payload.find("[")
+        if offset < 0:
+            return None
+        while offset < len(payload):
+            while offset < len(payload) and payload[offset].isspace():
+                offset += 1
+            if offset >= len(payload):
+                break
+            try:
+                value, end = decoder.raw_decode(payload, offset)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            values.append(value)
+            offset = end
+
+        if len(values) == 1 and isinstance(values[0], dict):
+            return values[0]
+        if len(values) >= 2 and isinstance(values[-1], dict):
+            prefixes = values[:-1]
+            if all(SummaryGenerator._is_read_tool_args(value) for value in prefixes):
+                return values[-1]
+        if len(values) == 1 and isinstance(values[0], list) and len(values[0]) == 1 \
+                and isinstance(values[0][0], dict):
+            return values[0][0]
+        return None
+
+    @staticmethod
+    def _is_read_tool_args(value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        keys = set(value)
+        if keys == {"file_path"}:
+            return isinstance(value.get("file_path"), str)
+        if keys == {"file_path", "start_line", "end_line"}:
+            return (isinstance(value.get("file_path"), str)
+                    and isinstance(value.get("start_line"), int)
+                    and isinstance(value.get("end_line"), int))
+        return not keys
 
     def _save_cache(self, summaries: dict, cache_path: str):
         """保存摘要缓存"""

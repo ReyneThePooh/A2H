@@ -20,7 +20,8 @@ from pathlib import Path
 from run_control import run_process
 from pipeline.artifacts import (
     ArtifactContractError, MANIFEST_NAME, atomic_write_json, code_without_comments,
-    content_hash, load_artifact_manifest, project_source_fingerprint, refresh_artifact_hashes, validate_project_contract,
+    content_hash, load_artifact_manifest, project_source_fingerprint, refresh_artifact_hashes,
+    validate_project_contract,
 )
 
 # 模板中不需要复制的缓存/产物目录
@@ -538,10 +539,10 @@ def package_project(
     src_ets = src_main / "ets"
     if not src_ets.exists():
         raise FileNotFoundError(f"生成侧无 ets 目录: {src_ets}")
-    manifest = load_artifact_manifest(generated_dir)
     issues = validate_project_contract(generated_dir)
     if issues:
         raise ArtifactContractError("Translation contract rejected packaging: " + json.dumps(issues, ensure_ascii=False))
+    manifest = load_artifact_manifest(generated_dir)
 
     print("=" * 50)
     print("工程打包（套 DevEco 模板）")

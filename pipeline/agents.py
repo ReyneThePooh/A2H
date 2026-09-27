@@ -29,8 +29,9 @@ from run_control import BudgetExceeded, check_budget, consume_budget, remaining_
 # ============================================================
 
 #: 判定为"可重试的瞬态错误"的关键词（匹配异常消息，忽略大小写）
-_MAX_ATTEMPTS = 3        # 总尝试次数（首次 + 2 次重试）
+_MAX_ATTEMPTS = 3        # 默认总尝试次数（首次 + 2 次重试）
 _BASE_DELAY_S = 2.0      # 指数退避基数：2s → 4s
+_MAX_DELAY_S = 30.0      # 环境调高上限时仍限制单次退避
 
 
 class LLMCallError(HelloAgentsException):
@@ -74,9 +75,24 @@ def _is_transient(exc: Exception) -> bool:
     return bool(getattr(_classify_llm_error(exc), "retryable", False))
 
 
+def _retry_limit() -> int:
+    """Return a finite retry attempt limit."""
+    raw = os.getenv("LLM_MAX_ATTEMPTS", "").strip()
+    if not raw:
+        return _MAX_ATTEMPTS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _MAX_ATTEMPTS
+    return max(1, value)
+
+
 def _retry_transient(fn, what: str):
     """执行 fn()；瞬态网络错误指数退避重试，非瞬态错误（如鉴权失败）立即抛出。"""
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
+    limit = _retry_limit()
+    attempt = 0
+    while attempt < limit:
+        attempt += 1
         check_budget()
         try:
             return fn()
@@ -84,13 +100,13 @@ def _retry_transient(fn, what: str):
             raise
         except Exception as e:
             failure = _classify_llm_error(e)
-            if attempt == _MAX_ATTEMPTS or not failure.retryable:
+            if attempt >= limit or not failure.retryable:
                 if failure is e:
                     raise
                 raise failure from e
-            delay = _BASE_DELAY_S * (2 ** (attempt - 1))
-            print(f"      ⏳ {what}瞬态错误，{delay:.0f}s 后重试"
-                  f"（{attempt}/{_MAX_ATTEMPTS - 1}）: {failure.reason}")
+            delay = min(_MAX_DELAY_S, _BASE_DELAY_S * (2 ** min(attempt - 1, 6)))
+            progress = f"第 {attempt} 次失败，最多 {limit} 次"
+            print(f"      ⏳ {what}瞬态错误，{delay:.0f}s 后重试（{progress}）: {failure.reason}")
             time.sleep(remaining_timeout(delay))
             check_budget()
 
@@ -241,7 +257,7 @@ def create_pipeline_llm(temperature: float = 0.3) -> HelloAgentsLLM:
     """构造流水线使用的 HelloAgentsLLM（带瞬态错误重试）。
 
     HelloAgentsLLM 与原 LLMClient 读取相同的环境变量
-    （LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL / LLM_TIMEOUT），
+    （LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL / LLM_TIMEOUT / LLM_MAX_ATTEMPTS），
     仅超时默认值不同，这里显式保持流水线原默认 180 秒。
     """
     return RetryingLLM(
@@ -511,6 +527,8 @@ class TranslationPlanAgent(PipelineAgent):
 - "L1-L28"  (import 区域)
 - "L30-L40" (类声明和字段)
 - "L42-L87" (具体方法)
+- read_regions.file 只能填写当前 output.sources 中的原始 Android .java 或 .xml 文件；
+  不要填写依赖单元生成的 .ets 文件。依赖的 .ets 只通过 depends_on 引用，接口由依赖上下文提供。
 
 ## 输出格式（严格 JSON）
 {

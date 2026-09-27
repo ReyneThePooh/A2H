@@ -10,7 +10,10 @@ from pathlib import Path
 from run_control import (Budget, BudgetExceeded, FileLock, LockUnavailable,
                          ResumeMismatch, RunJournal,
                          budget_scope, file_sha256, fingerprint)
-from pipeline.artifacts import validate_project_contract, project_source_fingerprint
+from pipeline.artifacts import (
+    repair_generated_contract, project_source_fingerprint,
+    validate_project_contract,
+)
 
 
 class StageFailure(RuntimeError):
@@ -206,7 +209,7 @@ def run_stages(entry, args, run_root, journal, budget):
             "config_yaml": file_sha256(engine_root / "config.yaml"),
             "environment": {k: os.getenv(k, "") for k in (
                 "LLM_MODEL_ID", "LLM_BASE_URL", "PIPELINE_MODEL", "LLM_PROVIDER",
-                "NODE_HOME", "HDC_PATH", "LLM_TIMEOUT")}}),
+                "NODE_HOME", "HDC_PATH", "LLM_TIMEOUT", "LLM_MAX_ATTEMPTS")}}),
     }
     from pipeline.unit_translator import UnitTranslator
     inputs["sdk_sha256"] = fingerprint(UnitTranslator._sdk_fingerprint_inputs())
@@ -261,7 +264,9 @@ def run_stages(entry, args, run_root, journal, budget):
                             {"unit": result.unit_name, "file": result.file_name,
                              "status": result.status, "error": result.error}
                             for result in results if not result.success])
-                    require_contract(generated)
+                    issues = repair_generated_contract(generated)
+                    if issues:
+                        raise StageFailure("TRANSLATION_CONTRACT_INVALID", issues)
                     checkpoint("generated", generated)
         if stage_done("package"):
             if (not build_is_current(packaged) and journal.state.get("packaged_sha256")

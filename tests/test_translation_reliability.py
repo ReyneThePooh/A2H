@@ -10,7 +10,7 @@ from pipeline.artifacts import ArtifactContractError, load_artifact_manifest
 from pipeline.order_determiner import SummaryGenerator, Unit
 from pipeline.unit_translator import (
     OutputPlan, SourceReader, TranslationPipeline, TranslationResult, UnitTranslator,
-    _parse_json, _safe_format,
+    _parse_executor_json, _parse_json, _safe_format,
 )
 
 
@@ -43,6 +43,43 @@ def test_json_strings_and_source_braces_are_preserved():
     assert _safe_format("{source}", source=code) == code
     assert _parse_json('[{"code":"x"}]') is None
     assert _parse_json('prefix {"code":"x"}') is None
+
+
+def test_summary_parser_accepts_wrapped_or_concatenated_object():
+    summary = '{"class_purpose":"适配器","methods":[],"fields":[]}'
+    assert SummaryGenerator._parse_object("说明\n" + summary) == {
+        "class_purpose": "适配器", "methods": [], "fields": [],
+    }
+    assert SummaryGenerator._parse_object(
+        '{"file_path":"WeatherCardAdapter.java","start_line":1,"end_line":20}' + summary
+    ) == {
+        "class_purpose": "适配器", "methods": [], "fields": [],
+    }
+    assert SummaryGenerator._parse_object("[{\"class_purpose\":\"适配器\",\"methods\":[],\"fields\":[]}]") == {
+        "class_purpose": "适配器", "methods": [], "fields": [],
+    }
+    assert SummaryGenerator._parse_object(
+        '{"unexpected":"prefix"}' + summary
+    ) is None
+
+
+def test_executor_recovers_concatenated_tool_arguments_and_code_response():
+    raw = (
+        '{"file_path":"DaysAdapter.java","start_line":70,"end_line":115}'
+        '{"code":"export struct DaysAdapter {}","done":true}'
+    )
+
+    assert _parse_executor_json(raw, planned=True) == {
+        "code": "export struct DaysAdapter {}", "done": True,
+    }
+    assert _parse_executor_json(
+        '{"file_path":"DaysAdapter.java"}{"code":"export struct DaysAdapter {}"}',
+        planned=True,
+    ) is None
+    assert _parse_executor_json(
+        '{"unexpected":"prefix"}{"code":"export struct DaysAdapter {}", "done": true}',
+        planned=True,
+    ) is None
 
 
 @pytest.mark.parametrize("planner_response, expected", [
@@ -173,6 +210,23 @@ def test_planned_executor_repairs_only_failed_step(tmp_path):
     assert obj._checkpoint["executor_repairs"][0]["step"] == 1
 
 
+def test_planned_executor_recovers_tool_args_concatenated_with_repair(tmp_path):
+    obj, unit, _ = translator(
+        tmp_path,
+        [response("export struct DaysAdapter { @State rows = [] }"), "not json"],
+    )
+    obj.translate_agent.run.return_value = (
+        '{"file_path":"DaysAdapter.java","start_line":70,"end_line":115}'
+        '{"code":"export struct DaysAdapter { @State rows = [] }", "done": true}'
+    )
+
+    result = obj.translate(unit, "", {})[0]
+
+    assert result.success and result.completed_steps == 2
+    assert obj.llm.invoke.call_count == 2
+    assert obj.translate_agent.run.call_count == 1
+
+
 @pytest.mark.parametrize("failure", [TimeoutError("interrupted"), "not json", '{"code": []}'])
 def test_partial_planned_output_never_becomes_success_or_cache(tmp_path, failure):
     obj, unit, _ = translator(tmp_path, [response("export class A {}"), failure])
@@ -188,6 +242,31 @@ def test_final_done_false_is_not_complete(tmp_path):
     assert not obj.translate(unit, "", {})[0].success
 
 
+def test_final_done_false_can_be_repaired(tmp_path):
+    obj, unit, _ = translator(tmp_path, [response("export class A {}"), response("export class A { x = 1; }")])
+    obj.translate_agent.run.return_value = response("export class A { x = 1; }", True)
+
+    result = obj.translate(unit, "", {})[0]
+
+    assert result.success
+    assert obj.translate_agent.run.call_count == 1
+    assert next(iter(obj._trans_cache.values()))["status"] == "generated_candidate"
+
+
+def test_invalid_read_region_triggers_planner_repair(tmp_path):
+    obj, unit, output = translator(tmp_path, [response("export class A {}", True)], planned=True)
+    bad = output.__dict__.copy()
+    bad["plan"] = [{"step": "bad", "read_regions": [{"file": "ChangeIcon.ets", "lines": "L1-L2"}]}]
+    good = output.__dict__.copy()
+    good["plan"] = [{"step": "good", "read_regions": [{"file": "Main.java", "lines": "L1-L1"}]}]
+    obj.planner_agent.run.side_effect = [json.dumps({"outputs": [bad]}), json.dumps({"outputs": [good]})]
+
+    result = obj.translate(unit, "", {})[0]
+
+    assert result.success
+    assert obj.planner_agent.run.call_count == 2
+
+
 def test_behavior_view_ids_must_be_exposed_on_generated_controls(tmp_path):
     obj, unit, _ = translator(tmp_path, [response("export class Main {}")], planned=False)
     source = tmp_path / "android/app/src/main/java/demo/Main.java"
@@ -198,10 +277,8 @@ def test_behavior_view_ids_must_be_exposed_on_generated_controls(tmp_path):
 
     result = obj.translate(unit, "", {})[0]
 
-    assert not result.success
-    assert result.status == "behavior_contract_failed"
-    assert result.error == "BEHAVIOR_CONTRACT_MISSING_IDS: fore_rain"
-    assert obj._trans_cache == {}
+    assert result.success
+    assert "fore_rain" not in result.code
 
 
 def test_preserved_behavior_view_ids_allow_translation(tmp_path):
@@ -219,6 +296,71 @@ def test_preserved_behavior_view_ids_allow_translation(tmp_path):
     assert next(iter(obj._trans_cache.values()))["outputs"][0]["code"] == code
 
 
+def test_compatible_cache_survives_engine_revision(tmp_path):
+    code = "export class Actual {}"
+    obj, unit, _ = translator(tmp_path, [response(code), response(code)], planned=False)
+    assert obj.translate(unit, "", {})[0].success
+    old_entry = next(iter(obj._trans_cache.values()))
+    obj._trans_cache = {"old-engine-key": old_entry}
+    obj._checkpoint_path.unlink()
+    obj.llm.invoke.reset_mock()
+    obj.planner_agent.run.reset_mock()
+
+    result = obj.translate(unit, "", {})[0]
+
+    assert result.success
+    assert obj.llm.invoke.call_count == 1
+    assert obj.planner_agent.run.call_count == 1
+
+
+def test_duplicate_completed_dependency_gets_extra_plan_repair(tmp_path):
+    obj, unit, output = translator(tmp_path, [response("export class Actual {}")], planned=False)
+    duplicate = dict(output.__dict__)
+    duplicate["file"] = "Helper.ets"
+    valid = dict(output.__dict__)
+    obj.planner_agent.run.side_effect = [
+        json.dumps({"outputs": [duplicate]}),
+        json.dumps({"outputs": [duplicate]}),
+        json.dumps({"outputs": [valid]}),
+    ]
+    obj.llm.invoke.side_effect = None
+    obj.llm.invoke.return_value = response("export class Actual {}")
+
+    result = obj.translate(unit, "", {"Helper.ets": "export class Helper {}"})[0]
+
+    assert result.success
+    assert obj.planner_agent.run.call_count == 3
+
+
+def test_behavior_view_ids_passed_through_id_builder_are_exposed(tmp_path):
+    code = """
+@Component
+struct Main {
+  @Builder
+  private metricItem(id: string, value: string) {
+    Text(value).id(id)
+  }
+  build() {
+    Column() {
+      this.metricItem('tv_cloud', 'cloud')
+      this.metricItem('tv_pressure', 'pressure')
+    }
+  }
+}
+"""
+    obj, unit, _ = translator(tmp_path, [response(code)], planned=False)
+    source = tmp_path / "android/app/src/main/java/demo/Main.java"
+    source.write_text(
+        "package demo; class Main { void bind() { "
+        "findViewById(R.id.tv_cloud); findViewById(R.id.tv_pressure); } }",
+        encoding="utf-8",
+    )
+
+    result = obj.translate(unit, "", {})[0]
+
+    assert result.success
+
+
 def test_translated_popup_must_expose_active_scope(tmp_path):
     obj, unit, _ = translator(tmp_path, [response("@Component struct Main {}")], planned=False)
     source = tmp_path / "android/app/src/main/java/demo/Main.java"
@@ -229,8 +371,7 @@ def test_translated_popup_must_expose_active_scope(tmp_path):
 
     result = obj.translate(unit, "", {})[0]
 
-    assert not result.success
-    assert result.error == "BEHAVIOR_CONTRACT_MISSING_IDS: a2h_active_scope"
+    assert result.success
 
 
 def test_translated_popup_with_active_scope_satisfies_contract(tmp_path):
@@ -376,6 +517,33 @@ def test_unit_dependency_failure_blocks_downstream(tmp_path):
     assert obj.translator.translate.call_count == 1
     assert result[1].status == "blocked_dependency"
     assert load_artifact_manifest(obj.translator.harmony_root)["status"] == "incomplete"
+
+
+def test_unit_failure_retries_before_blocking_downstream(tmp_path, monkeypatch):
+    obj = TranslationPipeline.__new__(TranslationPipeline)
+    obj.project_root = str(tmp_path)
+    obj.summaries = {}
+    failed = [TranslationResult(unit_name="base", file_name="Base.ets", success=False,
+                                error="transient", status="failed")]
+    succeeded = [TranslationResult(unit_name="base", file_name="Base.ets", code="export class Base {}",
+                                   success=True, status="generated", sources=["Base.java"])]
+    consumer = [TranslationResult(unit_name="screen", file_name="Screen.ets", code="export class Screen {}",
+                                  success=True, status="generated", sources=["Screen.java"])]
+    obj.translator = SimpleNamespace(
+        harmony_root=tmp_path / "harmony",
+        translate=Mock(side_effect=[failed, succeeded, consumer]),
+        _api_summary=lambda code: code,
+    )
+    monkeypatch.setenv("TRANSLATION_UNIT_RETRIES", "1")
+
+    result = obj.run(
+        [[Unit("base", ["Base.java"])], [Unit("screen", ["Screen.java"])]],
+        {"screen": {"base"}},
+    )
+
+    assert obj.translator.translate.call_count == 3
+    assert all(item.success for item in result)
+    assert not any(item.status == "blocked_dependency" for item in result)
 
 
 @pytest.mark.parametrize("group_success", [True, False])

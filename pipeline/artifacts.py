@@ -379,3 +379,112 @@ def build_translation_manifest(source_root: str | Path, units: list, results: li
     if android_manifest.get("error"):
         data["issues"].append({"code": "CONTRACT_ANDROID_MANIFEST", "file": "AndroidManifest.xml", "message": android_manifest["error"]})
     return data
+
+
+def repair_generated_contract(project_dir: str | Path) -> list[dict]:
+    """Repair deterministic page-role and route aliases before validation.
+
+    This is intentionally limited to generated page metadata. Missing files,
+    ambiguous ownership and hash/provenance violations remain hard failures.
+    """
+    root = Path(project_dir)
+    try:
+        data = load_artifact_manifest(root)
+    except ArtifactContractError:
+        return validate_project_contract(root)
+
+    outputs = data["outputs"]
+    activities = data.get("required_activities", [])
+
+    # Do not turn a stale or edited output into a valid artifact by rewriting
+    # its recorded hash. Repair only metadata for files still matching it.
+    for output in outputs:
+        path = project_path(root, output["path"])
+        if not path.is_file() or content_hash(path.read_bytes()) != output.get("sha256"):
+            return validate_project_contract(root)
+
+    def activity_stem(name: str) -> str:
+        return name.rsplit(".", 1)[-1]
+
+    def source_for_activity(activity: str, output: dict) -> str | None:
+        stem = activity_stem(activity)
+        for source in output.get("sources", []):
+            if Path(source).stem == stem:
+                return source
+        return None
+
+    # Activity-backed components are runnable pages when they are the only
+    # output for that Activity source.
+    for activity in activities:
+        candidates = [(output, source_for_activity(activity, output)) for output in outputs]
+        candidates = [(output, source) for output, source in candidates if source]
+        if len(candidates) != 1:
+            continue
+        output, _ = candidates[0]
+        path = project_path(root, output["path"])
+        if output.get("role") == "component" and path.is_file():
+            code = path.read_text(encoding="utf-8")
+            if re.search(r"(?m)^\s*@Component(?:V2)?\b", code) and not re.search(r"(?m)^\s*@Entry\b", code):
+                lines = code.splitlines(keepends=True)
+                insert_at = 0
+                while insert_at < len(lines) and lines[insert_at].lstrip().startswith("import "):
+                    insert_at += 1
+                lines.insert(insert_at, "@Entry\n")
+                path.write_text("".join(lines), encoding="utf-8", newline="")
+                output["role"] = "page"
+                output["sha256"] = content_hash(path.read_bytes())
+
+    # Recompute page routes from paths and rebuild missing Activity mappings.
+    for output in outputs:
+        if output.get("role") != "page":
+            output["route"] = None
+            continue
+        relative = output["path"]
+        expected = Path(relative).relative_to("entry/src/main/ets").with_suffix("").as_posix()
+        output["route"] = expected
+
+    pages = []
+    for activity in activities:
+        matches = []
+        for output in outputs:
+            source = source_for_activity(activity, output)
+            if source and output.get("role") == "page":
+                matches.append((output, source))
+        if len(matches) == 1:
+            output, source = matches[0]
+            pages.append({"android_activity": activity, "source": source,
+                          "output": output["path"], "route": output["route"],
+                          "unit_id": output["unit_id"]})
+    data["pages"] = pages
+
+    page_by_activity = {page["android_activity"]: page for page in pages}
+    launcher = data.get("launcher")
+    if isinstance(launcher, dict) and launcher.get("android_activity") in page_by_activity:
+        page = page_by_activity[launcher["android_activity"]]
+        launcher.update(route=page["route"], output=page["output"])
+
+    # Normalize common model-generated aliases such as Preview -> PreviewPage.
+    aliases = {}
+    for page in pages:
+        stem = activity_stem(page["android_activity"])
+        aliases[f"pages/{stem}"] = page["route"]
+        aliases[f"pages/{stem}Page"] = page["route"]
+    for output in outputs:
+        path = project_path(root, output["path"])
+        if not path.is_file():
+            continue
+        code = path.read_text(encoding="utf-8")
+        for alias, route in aliases.items():
+            if alias == route:
+                continue
+            pattern = re.compile(
+                rf"(\b(?:pushUrl|replaceUrl)\s*\(\s*\{{[^}}]*?\burl\s*:\s*)"
+                rf"(['\"]){re.escape(alias)}\2", re.S,
+            )
+            code = pattern.sub(lambda match: f"{match.group(1)}{match.group(2)}{route}{match.group(2)}", code)
+        if code != path.read_text(encoding="utf-8"):
+            path.write_text(code, encoding="utf-8", newline="")
+            output["sha256"] = content_hash(path.read_bytes())
+
+    write_artifact_manifest(root, data)
+    return validate_project_contract(root)

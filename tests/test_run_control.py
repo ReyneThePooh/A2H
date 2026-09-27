@@ -249,6 +249,21 @@ def test_unknown_request_failure_without_status_is_retried(monkeypatch):
     assert len(calls) == 3
 
 
+def test_transient_retry_limit_is_finite_and_configurable(monkeypatch):
+    monkeypatch.setenv("LLM_MAX_ATTEMPTS", "4")
+    monkeypatch.setattr("pipeline.agents._BASE_DELAY_S", .001)
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise TimeoutError("transport timed out")
+
+    with rc.budget_scope(rc.Budget(max_llm_calls=10)):
+        with pytest.raises(LLMCallError, match="transient_http|transport|request_failed"):
+            _fake_llm(create).invoke([])
+    assert len(calls) == 4
+
+
 def test_complete_response_is_returned_and_sdk_retries_disabled():
     options = []
     llm = _fake_llm(lambda **kwargs: FakeStream([_chunk("complete"), _chunk(reason="stop")]))

@@ -148,6 +148,12 @@ def test_failed_build_retains_current_repair_for_next_run(tmp_path, monkeypatch)
     assert json.loads((tmp_path / "work/build_result.json").read_text())["status"] == "BUILD_FAILED"
     assert BuildFixLoop._locate(root, "../../escape.ets") is None
 
+    resumed = BuildFixLoop(llm=object(), max_fix_rounds=1).run(
+        root, workspace=tmp_path / "work"
+    )
+    assert resumed["stop_reason"] == "NO_PROGRESS_PERSISTED"
+    assert resumed["builds"] == 0
+
 
 def test_post_build_validation_failure_invalidates_build_reuse(tmp_path, monkeypatch):
     import subprocess

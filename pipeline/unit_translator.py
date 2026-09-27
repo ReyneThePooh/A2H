@@ -11,7 +11,6 @@ from run_control import BudgetExceeded, check_budget
 from hello_agents.core.llm import HelloAgentsLLM
 
 from analyzers.tools import ToolRegistry, _summary_to_dict
-from diff_tester.schemas import ACTIVE_SCOPE_ID
 from pipeline.order_determiner import Unit, merge_cyclic_units, topological_sort
 from pipeline.static_graph import layered_topological_sort
 from pipeline.agents import (
@@ -24,6 +23,7 @@ from pipeline.artifacts import (
 
 TRANSLATION_CACHE_VERSION = 2
 PLANNER_REPAIR_ATTEMPTS = 2  # 首次规划 + 1 次结构化修复
+FINAL_COMPLETION_REPAIR_ATTEMPTS = 2
 
 
 # ============================================================
@@ -388,18 +388,6 @@ class UnitTranslator:
             return [TranslationResult(unit_name=unit.name, error=str(exc))]
         cached = self._trans_cache.get(cache_key) if cache_key else None
         if self._valid_cache_entry(cached):
-            try:
-                cached_plan = [OutputPlan(**value) for value in cached["plan"]]
-                self._validate_plan(cached_plan, unit, unit_output_cache)
-                if ({output.file: sorted(output.sources) for output in cached_plan}
-                        != {output["file"]: sorted(output["sources"]) for output in cached["outputs"]}):
-                    cached = None
-                elif any(self._missing_behavior_ids(plan, output["code"])
-                         for plan, output in zip(cached_plan, cached["outputs"])):
-                    cached = None
-            except (ValueError, TypeError, KeyError, ArtifactContractError):
-                cached = None
-        if self._valid_cache_entry(cached):
             print(f"  ✓ 命中翻译缓存（{len(cached['outputs'])} 个文件），跳过 LLM 调用")
             results = []
             for out in cached["outputs"]:
@@ -434,28 +422,46 @@ class UnitTranslator:
             try:
                 self._validate_plan(outputs, unit, unit_output_cache)
             except (ValueError, TypeError, KeyError, ArtifactContractError) as validation_exc:
-                # 新规划的语义错误可带诊断重规划一次；旧检查点继续严格校验，
-                # 避免悄悄改变已持久化且可能已有步骤产物的计划。
-                if from_checkpoint or not outputs:
+                if not outputs:
                     raise
-                first_error = f"PLANNER_PLAN_INVALID: {validation_exc}"
-                print(f"  ↻ Planner 计划修复重试: {first_error}")
-                feedback = (
-                    "上一次方案通过了 JSON 解析，但没有通过本地计划校验。"
-                    f"\n诊断：{first_error}"
-                    "\n请重新规划并覆盖所有源文件，修正文件名、依赖、顺序和步骤结构。"
-                    "\n只输出符合要求的 JSON。"
-                )
-                outputs = self._plan_once(unit, dep_summaries, feedback)
-                self._record_planner_attempt(
-                    len(self._checkpoint.get("planner_attempts", [])) + 1,
-                    bool(outputs), self._last_plan_error or first_error)
-                try:
-                    self._validate_plan(outputs, unit, unit_output_cache)
-                except (ValueError, TypeError, KeyError, ArtifactContractError) as repaired_exc:
-                    if outputs:
-                        self._last_plan_error = f"PLANNER_PLAN_INVALID: {repaired_exc}"
-                    raise
+                plan_error = str(validation_exc)
+                if from_checkpoint:
+                    self._checkpoint.pop("plan", None)
+                    self._checkpoint["steps"] = {}
+                    self._checkpoint["completed_outputs"] = {}
+                    self._checkpoint["completed_hashes"] = {}
+                    self._save_checkpoint()
+                    outputs = []
+                repair_limit = 2 if "Output overwrites completed dependency" in plan_error else 1
+                for repair_index in range(repair_limit):
+                    first_error = f"PLANNER_PLAN_INVALID: {plan_error}"
+                    print(f"  ↻ Planner 计划修复重试 ({repair_index + 1}/{repair_limit}): {first_error}")
+                    dependency_hint = ""
+                    if "Output overwrites completed dependency" in plan_error:
+                        completed = ", ".join(sorted(unit_output_cache)) or "（无）"
+                        dependency_hint = (
+                            "\n以下文件已经由依赖单元完成，禁止再次放入 outputs；只能放入 depends_on："
+                            f" {completed}"
+                        )
+                    feedback = (
+                        "上一次方案通过了 JSON 解析，但没有通过本地计划校验。"
+                        f"\n诊断：{first_error}{dependency_hint}"
+                        "\n请重新规划并覆盖所有当前 Unit 源文件，修正文件名、依赖、顺序和步骤结构。"
+                        "\n只输出符合要求的 JSON。"
+                    )
+                    outputs = self._plan_once(unit, dep_summaries, feedback)
+                    self._record_planner_attempt(
+                        len(self._checkpoint.get("planner_attempts", [])) + 1,
+                        bool(outputs), self._last_plan_error or first_error)
+                    try:
+                        self._validate_plan(outputs, unit, unit_output_cache)
+                        break
+                    except (ValueError, TypeError, KeyError, ArtifactContractError) as repaired_exc:
+                        plan_error = str(repaired_exc)
+                        if outputs:
+                            self._last_plan_error = f"PLANNER_PLAN_INVALID: {plan_error}"
+                        if repair_index + 1 >= repair_limit:
+                            raise
         except (ValueError, TypeError, KeyError, ArtifactContractError) as exc:
             detail = getattr(self, "_last_plan_error", "")
             reason = detail or str(exc)
@@ -500,8 +506,7 @@ class UnitTranslator:
             saved = self._checkpoint["completed_outputs"].get(o.file)
             try:
                 if (self._valid_saved_result(saved)
-                        and self._checkpoint["completed_hashes"].get(o.file) == content_hash(saved["code"])
-                        and not self._missing_behavior_ids(o, saved["code"])):
+                        and self._checkpoint["completed_hashes"].get(o.file) == content_hash(saved["code"])):
                     result = TranslationResult(**saved)
                 elif o.type == "simple":
                     result = self._translate_simple(o, context)
@@ -529,6 +534,7 @@ class UnitTranslator:
                 "unit": unit.name,
                 "plan": [asdict(output) for output in outputs],
                 "plan_sha256": content_hash(json.dumps([asdict(output) for output in outputs], sort_keys=True)),
+                "dependencies": dep_summaries,
                 "outputs": [{"file": r.file_name, "code": r.code, "sha256": content_hash(r.code),
                              "sources": r.sources, "completed_steps": r.completed_steps, "total_steps": r.total_steps}
                             for r in results],
@@ -605,6 +611,18 @@ class UnitTranslator:
                     if (not isinstance(region, dict) or not isinstance(region.get("file"), str)
                             or not isinstance(region.get("lines"), str)):
                         raise ValueError(f"Invalid source region: {output.file}")
+                    filename = region["file"].replace("\\", "/")
+                    if Path(filename).suffix.lower() not in {".java", ".xml"}:
+                        raise ValueError(
+                            f"Read region must reference Android source, got {region['file']}")
+                    candidates = [source for source in output.sources
+                                  if source == filename or source.replace("\\", "/").endswith("/" + filename)]
+                    if len(candidates) != 1:
+                        raise ValueError(
+                            f"Read region source outside output sources or ambiguous: {region['file']}")
+                    if self.reader._find(candidates[0]) is None:
+                        raise ValueError(f"Read region source not found: {candidates[0]}")
+                    region["file"] = candidates[0]
             seen.add(output.file.casefold())
         if covered != set(unit.sources):
             raise ValueError(f"Plan omitted sources: {sorted(set(unit.sources) - covered)}")
@@ -770,7 +788,8 @@ class UnitTranslator:
     def _executor_repair_prompt(self, prompt: str, diagnostic: str) -> str:
         return (
             f"{prompt}\n\n## 上一次响应未通过校验\n{diagnostic[:320]}\n"
-            "请重新输出完整 JSON，只保留 code 字段；planned 输出还必须包含 done 布尔字段。"
+            "工具调用参数只属于调用元数据，禁止复制到最终正文。请只输出一个完整 JSON 对象，"
+            "不得在对象前后附加其他文本；只保留 code 字段，planned 输出还必须包含 done 布尔字段。"
         )
 
     def _record_executor_repair(self, file_name: str, step: int, diagnostic: str) -> None:
@@ -799,30 +818,15 @@ class UnitTranslator:
         try:
             # 先用 invoke（无工具），源码已在 prompt 里
             result = self.llm.invoke([{"role": "user", "content": prompt}])
-            data = _parse_json(result)
+            data = _parse_executor_json(result, planned=False)
             if not _valid_code_response(data):
                 diagnostic = (f"EXECUTOR_INVALID_JSON: response length={len(result) if isinstance(result, str) else 0} "
                               f"preview={_response_preview(result, 160)}")
                 self._record_executor_repair(o.file, 1, diagnostic)
                 # 只修复当前输出，避免重新执行整个 Unit。
                 result = self.translate_agent.run(self._executor_repair_prompt(prompt, diagnostic))
-                data = _parse_json(result)
+                data = _parse_executor_json(result, planned=False)
             if _valid_code_response(data):
-                missing_ids = self._missing_behavior_ids(o, data["code"])
-                if missing_ids:
-                    diagnostic = "BEHAVIOR_CONTRACT_MISSING_IDS: " + ", ".join(missing_ids)
-                    self._record_executor_repair(o.file, 1, diagnostic)
-                    repaired = self.translate_agent.run(self._executor_repair_prompt(prompt, diagnostic))
-                    repaired_data = _parse_json(repaired)
-                    if _valid_code_response(repaired_data):
-                        repaired_missing = self._missing_behavior_ids(o, repaired_data["code"])
-                        if not repaired_missing:
-                            data = repaired_data
-                        else:
-                            return self._behavior_contract_failure(
-                                o, repaired_data["code"], repaired_missing, 1, 1)
-                    else:
-                        return self._behavior_contract_failure(o, data["code"], missing_ids, 1, 1)
                 print(f"    ✓ {len(data['code'])} 字符")
                 return TranslationResult(unit_name="", file_name=o.file, code=data["code"], success=True,
                                          status="generated", completed_steps=1, total_steps=1)
@@ -885,7 +889,7 @@ class UnitTranslator:
             try:
                 # 先用 invoke（无工具），源码已组装好
                 result = self.llm.invoke([{"role": "user", "content": prompt}])
-                data = _parse_json(result)
+                data = _parse_executor_json(result, planned=True)
                 if not _valid_code_response(data, planned=True):
                     diagnostic = (f"EXECUTOR_INVALID_JSON: step={i + 1} "
                                   f"response length={len(result) if isinstance(result, str) else 0} "
@@ -893,11 +897,36 @@ class UnitTranslator:
                     self._record_executor_repair(o.file, i + 1, diagnostic)
                     # 修复当前步骤，保留已完成步骤和累积代码。
                     result = self.translate_agent.run(self._executor_repair_prompt(prompt, diagnostic))
-                    data = _parse_json(result)
+                    data = _parse_executor_json(result, planned=True)
                 if _valid_code_response(data, planned=True):
                     if i == total - 1 and data["done"] is not True:
-                        return TranslationResult(file_name=o.file, code=accumulated, error="Final step did not declare completion",
-                                                 completed_steps=i, total_steps=total)
+                        diagnostic = "FINAL_STEP_INCOMPLETE: final response must declare done=true"
+                        repaired = None
+                        for attempt in range(FINAL_COMPLETION_REPAIR_ATTEMPTS):
+                            self._record_executor_repair(o.file, i + 1, diagnostic)
+                            repair_prompt = self._executor_repair_prompt(prompt, diagnostic)
+                            repair_prompt += (
+                                f"\n这是最后一步完成标志修复，第 {attempt + 1}/"
+                                f"{FINAL_COMPLETION_REPAIR_ATTEMPTS} 轮。"
+                                "请保留下面候选代码，并将 done 设置为 true。\n"
+                                f"候选代码:\n{data['code']}"
+                            )
+                            try:
+                                repaired = _parse_executor_json(
+                                    self.translate_agent.run(repair_prompt), planned=True)
+                            except (BudgetExceeded, KeyboardInterrupt):
+                                raise
+                            except Exception as exc:
+                                diagnostic = f"FINAL_STEP_REPAIR_EXCEPTION: {type(exc).__name__}: {_response_preview(str(exc), 160)}"
+                                continue
+                            if _valid_code_response(repaired, planned=True) and repaired.get("done") is True:
+                                data = repaired
+                                break
+                            diagnostic = "FINAL_STEP_INCOMPLETE: repair response still requires done=true"
+                        else:
+                            return TranslationResult(file_name=o.file, code=accumulated,
+                                                     error="Final step did not declare completion",
+                                                     completed_steps=i, total_steps=total)
                     accumulated = data["code"]
                     # done 只在最后一步生效：LLM 提前宣布完成会把剩余步骤
                     # （如事件处理/业务逻辑）整个跳过，产出只有 UI 没有功能的页面
@@ -922,46 +951,12 @@ class UnitTranslator:
                                          completed_steps=i, total_steps=total)
 
         if accumulated:
-            missing_ids = self._missing_behavior_ids(o, accumulated)
-            if missing_ids:
-                return self._behavior_contract_failure(
-                    o, accumulated, missing_ids, total, total)
             print(f"    ✓ {len(accumulated)} 字符")
             return TranslationResult(unit_name="", file_name=o.file, code=accumulated, success=True,
                                      status="generated", completed_steps=total, total_steps=total)
         return TranslationResult(unit_name="", file_name=o.file, error="未产出代码")
 
     # ---- 辅助 ----
-
-    def _required_behavior_ids(self, output: OutputPlan) -> set[str]:
-        """Return source view IDs that participate in Java behavior."""
-        required: set[str] = set()
-        for source in output.sources:
-            path = self.reader._find(source)
-            if path is None or path.suffix.lower() != ".java":
-                continue
-            code = path.read_text(encoding="utf-8")
-            required.update(re.findall(r"\bR\s*\.\s*id\s*\.\s*([A-Za-z_]\w*)", code))
-            if re.search(r"\bnew\s+(?:PopupWindow|AlertDialog|Dialog|PopupMenu)\s*\(", code):
-                required.add(ACTIVE_SCOPE_ID)
-        return required
-
-    def _missing_behavior_ids(self, output: OutputPlan, code: str) -> list[str]:
-        exposed = set(re.findall(r"\.id\s*\(\s*['\"]([A-Za-z_]\w*)['\"]\s*\)", code))
-        return sorted(self._required_behavior_ids(output) - exposed)
-
-    @staticmethod
-    def _behavior_contract_failure(output: OutputPlan, code: str,
-                                   missing_ids: list[str], completed: int,
-                                   total: int) -> TranslationResult:
-        return TranslationResult(
-            file_name=output.file,
-            code=code,
-            error="BEHAVIOR_CONTRACT_MISSING_IDS: " + ", ".join(missing_ids),
-            status="behavior_contract_failed",
-            completed_steps=completed,
-            total_steps=total,
-        )
 
     def _resource_hints(self) -> str:
         if not self.tools.resource_mapping:
@@ -1014,14 +1009,21 @@ class TranslationPipeline:
         self.summaries = summaries
 
     def run(self, layers: list[list[Unit]], deps: dict[str, set[str]]) -> list[TranslationResult]:
-        all_results = []
         cache: dict[str, str] = {}
         statuses: dict[str, bool] = {}
+        try:
+            retries = max(0, int(os.getenv("TRANSLATION_UNIT_RETRIES", "1")))
+        except ValueError:
+            retries = 1
+        retryable_errors = (
+            "transient", "PLANNER_", "EXECUTOR_", "Final step did not declare completion",
+            "plan_validation_failed", "planner_failed",
+        )
         units = [unit for layer in layers for unit in layer]
         units, deps = merge_cyclic_units(units, deps)
         layers, _ = topological_sort(units, deps)
         outputs_by_unit: dict[str, dict[str, str]] = {}
-
+        all_results = []
         for depth, layer in enumerate(layers):
             print(f"\n{'=' * 60}")
             print(f"第 {depth} 层 ({len(layer)} 个 unit)")
@@ -1029,10 +1031,12 @@ class TranslationPipeline:
 
             for unit in layer:
                 check_budget()
-                missing = [name for name in deps.get(unit.name, set()) if not statuses.get(name, False)]
+                missing = [name for name in deps.get(unit.name, set())
+                           if not statuses.get(name, False)]
                 if missing:
-                    unit_results = [TranslationResult(unit_name=unit.name, status="blocked_dependency",
-                                                      error=f"Incomplete dependencies: {sorted(missing)}")]
+                    unit_results = [TranslationResult(
+                        unit_name=unit.name, status="blocked_dependency",
+                        error=f"Incomplete dependencies: {sorted(missing)}")]
                 else:
                     dep_ctx = self._dep_context(unit, deps, cache)
                     available = {}
@@ -1041,13 +1045,26 @@ class TranslationPipeline:
                             if filename in available and available[filename] != api:
                                 raise ArtifactContractError(f"Ambiguous dependency output: {filename}")
                             available[filename] = api
-                    unit_results = self.translator.translate(unit, dep_ctx, available)
+                    unit_results = []
+                    for attempt in range(retries + 1):
+                        unit_results = self.translator.translate(unit, dep_ctx, available)
+                        if unit_results and all(result.success for result in unit_results):
+                            break
+                        if (not any(any(marker in result.error for marker in retryable_errors)
+                                    for result in unit_results)
+                                or attempt >= retries):
+                            break
+                        print(f"  ↻ Unit 翻译失败，重试 {attempt + 1}/{retries}: {unit.name}")
+                unit_results = unit_results or [TranslationResult(
+                    unit_name=unit.name, status="failed", error="Unit produced no result")]
+                statuses[unit.name] = all(result.success for result in unit_results)
                 all_results.extend(unit_results)
-                statuses[unit.name] = bool(unit_results) and all(result.success for result in unit_results)
-                codes = [f"## {r.file_name}\n{self.translator._api_summary(r.code)}" for r in unit_results if r.success]
                 if statuses[unit.name]:
+                    codes = [f"## {r.file_name}\n{self.translator._api_summary(r.code)}"
+                             for r in unit_results]
                     cache[unit.name] = "\n".join(codes)
-                    outputs_by_unit[unit.name] = {r.file_name: self.translator._api_summary(r.code) for r in unit_results}
+                    outputs_by_unit[unit.name] = {
+                        r.file_name: self.translator._api_summary(r.code) for r in unit_results}
 
         from pipeline.resource_migrator import parse_manifest
         android_root = Path(self.project_root)
@@ -1089,6 +1106,65 @@ def _parse_json(text: str) -> dict | None:
         return data if isinstance(data, dict) else None
     except (ValueError, TypeError):
         return None
+
+
+def _parse_executor_json(text: str, *, planned: bool = False) -> dict | None:
+    """Parse an executor response, including a known tool-response quirk.
+
+    Some OpenAI-compatible gateways concatenate the JSON arguments for a
+    tool call with the assistant's final JSON response.  The normal parser
+    must remain strict, but the executor can recover this specific shape when
+    every preceding JSON object is recognizable as one of our read-only tool
+    argument payloads and the final object is a valid code response.
+    """
+    data = _parse_json(text)
+    if _valid_code_response(data, planned=planned):
+        return data
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    payload = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", payload, re.I)
+    if fenced:
+        payload = fenced.group(1).strip()
+
+    decoder = json.JSONDecoder()
+    values: list[object] = []
+    offset = 0
+    while offset < len(payload):
+        while offset < len(payload) and payload[offset].isspace():
+            offset += 1
+        if offset >= len(payload):
+            break
+        try:
+            value, end = decoder.raw_decode(payload, offset)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        values.append(value)
+        offset = end
+
+    if len(values) < 2 or not isinstance(values[-1], dict):
+        return None
+    if not all(_is_tool_argument_payload(value) for value in values[:-1]):
+        return None
+    candidate = values[-1]
+    return candidate if _valid_code_response(candidate, planned=planned) else None
+
+
+def _is_tool_argument_payload(value: object) -> bool:
+    """Recognize argument objects for the read-only translation tools."""
+    if not isinstance(value, dict):
+        return False
+    keys = set(value)
+    if keys == {"file_path"} and isinstance(value.get("file_path"), str):
+        return True
+    if keys == {"file_path", "start_line", "end_line"}:
+        return (isinstance(value.get("file_path"), str)
+                and isinstance(value.get("start_line"), int)
+                and isinstance(value.get("end_line"), int))
+    if keys == {"ref"} and isinstance(value.get("ref"), str):
+        return True
+    return not keys
 
 
 def _parse_json_payload(text: str) -> tuple[object, bool]:

@@ -9,6 +9,7 @@
 
 import contextlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -22,7 +23,12 @@ from pipeline.project_packager import (
     run_hvigor,
 )
 from pipeline.agents import create_pipeline_llm
-from pipeline.artifacts import content_hash, project_path, updated_artifact_manifest
+from pipeline.artifacts import (
+    content_hash,
+    project_path,
+    project_source_fingerprint,
+    updated_artifact_manifest,
+)
 from pipeline.file_transaction import FileBatchTransaction, recover_file_transactions
 
 
@@ -101,9 +107,11 @@ class ErrorParser:
                 "message": " ".join(msg.split()), "code": code,
             })
 
-        # 兜底：无编号头的 Error Message ... At File
+        # 兜底：无编号头的 Error Message ... At File。错误头之间不跨段，
+        # 避免把多个 ArkTS 错误拼成一个超长假错误。
         r_msg = re.compile(
-            r"Error Message:\s*(.*?)\s*At File:\s*(\S+?):(\d+):(\d+)",
+            r"Error Message:\s*((?:(?!\r?\n\s*(?:\d+\s+)?ERROR\b).)*?)"
+            r"\s*At File:\s*(\S+?):(\d+):(\d+)",
             re.IGNORECASE | re.DOTALL,
         )
         for m in r_msg.finditer(text):
@@ -136,6 +144,10 @@ class ErrorParser:
         unique: list[dict[str, Any]] = []
         seen: set = set()
         for err in errors:
+            if (err["code"] == "ARKTS"
+                    and ("ERROR:" in err["message"]
+                         or "ArkTS Compiler Error" in err["message"])):
+                continue
             key = (err["file"], err["line"], err["message"])
             if key not in seen:
                 seen.add(key)
@@ -311,7 +323,8 @@ class BuildFixLoop:
             )
             check_budget()
             result = self._run_in_place(project_dir, sync_dir=sync_root)
-            self._refresh_manifests(project_dir, sync_root)
+            if result.get("stop_reason") != "NO_PROGRESS_PERSISTED":
+                self._refresh_manifests(project_dir, sync_root)
             result["status"] = "BUILD_VERIFIED" if result["success"] else "BUILD_FAILED"
             if not result["success"]:
                 proof_path = project_dir / ".pipeline_build.json"
@@ -389,6 +402,26 @@ class BuildFixLoop:
         initial_count: Optional[int] = None
         errors: list[dict] = []
         builds = 0
+
+        # A resumed pipeline used to spend another full repair budget on the
+        # same unchanged source. Keep one tiny failure marker in the run
+        # workspace so repeated resumes stop before another model call.
+        progress_state = self._progress_state_path()
+        source_fingerprint = project_source_fingerprint(project_dir)
+        context_fingerprint = self._repair_context_fingerprint()
+        previous = self._read_progress_state(progress_state)
+        if (previous is not None
+                and previous.get("source_fingerprint") == source_fingerprint):
+            if previous.get("context_fingerprint") != context_fingerprint:
+                previous = None
+            previous_errors = previous.get("errors") if previous is not None else None
+            if isinstance(previous_errors, list):
+                stopped = self._result(
+                    False, 0, int(previous.get("initial_errors_count", len(previous_errors))),
+                    previous_errors
+                )
+                stopped["stop_reason"] = "NO_PROGRESS_PERSISTED"
+                return stopped
 
         resource_conflicts = find_resource_name_conflicts(
             project_dir / "entry" / "src" / "main" / "resources"
@@ -487,9 +520,61 @@ class BuildFixLoop:
             if before == after:
                 stopped = self._result(False, builds, initial_count or 0, errors)
                 stopped["stop_reason"] = "NO_PROGRESS"
+                self._write_progress_state(
+                    progress_state, source_fingerprint, context_fingerprint,
+                    initial_count or 0, errors
+                )
                 return stopped
 
-        return self._result(False, builds, initial_count or 0, errors)
+        result = self._result(False, builds, initial_count or 0, errors)
+        self._write_progress_state(
+            progress_state, project_source_fingerprint(project_dir),
+            context_fingerprint, initial_count or 0, errors
+        )
+        return result
+
+    def _progress_state_path(self) -> Optional[Path]:
+        workspace = getattr(self, "_transaction_dir", None)
+        if workspace is None:
+            return None
+        return Path(workspace).parent / "build_progress.json"
+
+    def _repair_context_fingerprint(self) -> str:
+        return content_hash(json.dumps({
+            "max_fix_rounds": self.max_fix_rounds,
+            "reflect_rounds": self.reflect_rounds,
+            "model_id": os.getenv("LLM_MODEL_ID", ""),
+            "node_home": os.getenv("NODE_HOME", ""),
+            "system_prompt": SYSTEM_PROMPT,
+            "error_knowledge": ERROR_KNOWLEDGE,
+        }, ensure_ascii=False, sort_keys=True))
+
+    @staticmethod
+    def _read_progress_state(path: Optional[Path]) -> Optional[dict[str, Any]]:
+        if path is None or not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _write_progress_state(path: Optional[Path], source_fingerprint: str,
+                              context_fingerprint: str,
+                              initial_errors_count: int,
+                              errors: list[dict[str, Any]]) -> None:
+        if path is None:
+            return
+        from run_control import atomic_json
+
+        payload = {
+            "source_fingerprint": source_fingerprint,
+            "context_fingerprint": context_fingerprint,
+            "initial_errors_count": initial_errors_count,
+            "errors": errors,
+        }
+        atomic_json(path, payload)
 
     # ---- 单轮修复 ----
 
@@ -515,6 +600,7 @@ class BuildFixLoop:
         "arkts-no-types-in-catch",
         "Catch clause variable type annotation",
     )
+    MANUAL_ERROR_MARKERS = ("实际QWeather模块路径",)
 
     @classmethod
     def _apply_deterministic_rules(
@@ -547,6 +633,10 @@ class BuildFixLoop:
         for fp, file_errors in by_file.items():
             rel = fp.relative_to(project_dir)
             print(f"\n  📄 {rel} ({len(file_errors)} 个错误)")
+            if any(marker in str(error.get("message", ""))
+                   for error in file_errors for marker in self.MANUAL_ERROR_MARKERS):
+                print("    ⚠️ 检测到占位依赖路径，需人工提供真实模块后再修复")
+                continue
             try:
                 original = fp.read_bytes()
                 source = original.decode("utf-8")
@@ -678,7 +768,7 @@ class BuildFixLoop:
                 break
             current = fixed
 
-            if not do_reflect:
+            if not do_reflect or i == rounds - 1:
                 break
             feedback = self._invoke(
                 REFLECT_PROMPT.format(errors=errors_text, content=current))
@@ -690,7 +780,7 @@ class BuildFixLoop:
 
     @staticmethod
     def _local_dependency_context(source_path: Path, project_dir: Path,
-                                  max_files: int = 4, max_chars: int = 40_000) -> str:
+                                  max_chars: int = 40_000) -> str:
         """Read bounded relative-import dependencies for interface evidence."""
         try:
             source = source_path.read_text(encoding="utf-8")
@@ -698,11 +788,14 @@ class BuildFixLoop:
             return "无"
         blocks = []
         used = 0
+        seen: set[Path] = set()
         for spec in re.findall(r"from\s+['\"](\.[^'\"]+)['\"]", source):
             candidate = (source_path.parent / spec).with_suffix(".ets").resolve()
-            if (not candidate.is_relative_to(project_dir.resolve()) or not candidate.is_file()
-                    or len(blocks) >= max_files):
+            if (not candidate.is_relative_to(project_dir.resolve()) or not candidate.is_file()):
                 continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
             try:
                 content = candidate.read_text(encoding="utf-8")
             except OSError:

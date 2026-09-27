@@ -9,7 +9,7 @@ import pytest
 
 from pipeline.artifacts import (
     ArtifactContractError, build_translation_manifest, load_artifact_manifest,
-    output_role, project_source_fingerprint, stable_unit_id,
+    output_role, project_source_fingerprint, repair_generated_contract, stable_unit_id,
     validate_project_contract, write_artifact_manifest,
 )
 from pipeline.order_determiner import Unit
@@ -84,6 +84,34 @@ def test_invalid_contract_blocks_packaging_before_copy(tmp_path, failure):
 def test_dangling_navigation_is_contract_failure(tmp_path):
     root, _ = make_project(tmp_path, code="@Entry\n@Component\nstruct Screen { open() { router.pushUrl({ url: 'pages/Missing' }) } build() {} }")
     assert "CONTRACT_NAVIGATION" in {issue["code"] for issue in validate_project_contract(root)}
+
+
+def test_repair_generated_contract_promotes_activity_and_normalizes_route(tmp_path):
+    source = "java/example/StartActivity.java"
+    code = "@Component\nstruct Renamed { build() { router.pushUrl({ url: 'pages/StartActivityPage' }) } }"
+    result = TranslationResult(unit_name="screen", file_name="Renamed.ets", code=code,
+                               success=True, sources=[source])
+    data = build_translation_manifest(
+        tmp_path / "android", [Unit("screen", [source])], [result],
+        {source: SimpleNamespace(class_name="StartActivity", package="example")},
+        {"activities": [{"name": "example.StartActivity"}],
+         "launchers": [{"activity": "example.StartActivity", "component": "example.StartActivity"}]},
+    )
+    data["launcher"] = {"android_activity": "example.StartActivity",
+                        "component": "example.StartActivity",
+                        "route": "pages/Renamed", "output": data["outputs"][0]["path"]}
+    root = tmp_path / "harmony"
+    path = root / data["outputs"][0]["path"]
+    path.parent.mkdir(parents=True)
+    path.write_text(code, encoding="utf-8", newline="")
+    write_artifact_manifest(root, data)
+
+    assert repair_generated_contract(root) == []
+    repaired = load_artifact_manifest(root)
+    assert repaired["outputs"][0]["role"] == "page"
+    assert repaired["pages"][0]["route"] == "pages/Renamed"
+    assert "@Entry" in path.read_text(encoding="utf-8")
+    assert "pages/Renamed" in path.read_text(encoding="utf-8")
 
 
 def test_packaged_route_and_ability_are_both_checked(tmp_path):
